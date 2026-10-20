@@ -1612,9 +1612,12 @@ INT16 WINAPI GetSystemMetrics16( INT16 index )
          * virtual desktop metrics follow the monitor the emulator is actually
          * running on (e.g. a portrait secondary display). */
         POINT pt = { 0, 0 };
-        GetCursorPos(&pt);
-        HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        HMONITOR hMon;
+        /* Note: this SDK's winuser.h declares only "MONITORINFO" (no
+         * MONITORINFOA alias), so stick to the portable struct name. */
         MONITORINFO mi = { sizeof(mi) };
+        GetCursorPos(&pt);
+        hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
         if (hMon && GetMonitorInfoA(hMon, &mi) &&
             !(mi.dwFlags & MONITORINFOF_PRIMARY))
         {
@@ -3982,7 +3985,10 @@ BOOL16 WINAPI SystemParametersInfo16( UINT16 uAction, UINT16 uParam,
         {
             POINT pt = { 0, 0 };
             HMONITOR hMon = NULL;
-            MONITORINFOA mi = { sizeof(mi) };
+            /* MONITORINFOA is not typedef'd by every Windows SDK revision
+             * (some only provide tagMONITORINFO/MONITORINFO); use the
+             * portable name here as well. */
+            MONITORINFO mi = { sizeof(mi) };
             HWND hwnd = GetForegroundWindow();
             if (!hwnd) hwnd = GetActiveWindow();
             if (hwnd && IsWindow(hwnd))
