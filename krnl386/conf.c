@@ -17,35 +17,52 @@ static BOOL config_report_enabled = FALSE;
 static FILE *config_report_stream = NULL;
 static LONG config_report_count = 0;
 
+/* the launcher (otvdm.exe) enables its copy of the report in
+ * otvdm/config_report.c before krnl386 is even loaded; mirror that decision
+ * here so both halves write to the same log without requiring a second
+ * ConfigReport key read. The symbol lives in the launcher exe, which always
+ * loads krnl386.exe16, so it is guaranteed present at runtime; resolve it
+ * dynamically to avoid a load-time import on an exe that may be linked
+ * against us by other tools. */
+static BOOL launcher_report_enabled(void)
+{
+    typedef BOOL (*get_config_report_enabled_t)(void);
+    static get_config_report_enabled_t pfn = NULL;
+    static int tried = 0;
+
+    if (!tried)
+    {
+        tried = 1;
+        pfn = (get_config_report_enabled_t)GetProcAddress(GetModuleHandleA(NULL),
+                                                          "get_config_report_enabled");
+    }
+    return pfn ? pfn() : FALSE;
+}
+
 DWORD WINAPI krnl386_get_config_string(LPCSTR appname, LPCSTR keyname, LPCSTR def, LPSTR ret, DWORD size);
 DWORD WINAPI krnl386_get_config_int(LPCSTR appname, LPCSTR keyname, INT def);
 
 static void config_report_open(void)
 {
     CHAR path[MAX_PATH];
-    DWORD len;
 
     if (config_report_stream)
         return;
-    /* put the report next to otvdm.exe (the exe directory is already known
-     * at this point, or fall back to the module path directly); if that
-     * location isn't writable (e.g. Program Files) fall back to the current
-     * directory and finally stderr, so the report is never silently lost */
+    /* IMPORTANT: krnl386's 'filename' holds the path of otvdm.ini, not of
+     * any exe, so appending a log name to it would write into a bogus
+     * '...\Release\otvdm.ini\otvdm_config_report.log' path that can never
+     * exist. Always anchor the log on the real executable directory
+     * (krnl386 runs inside otvdm.exe / winevdm.com), then fall back to the
+     * current directory and finally stderr so the report is never lost. */
     path[0] = 0;
-    EnterCriticalSection(&critical_section);
-    if (filename[0])
+    if (GetModuleFileNameA(GetModuleHandleA(NULL), path, MAX_PATH))
     {
-        LPSTR slash = strrchr(filename, '\\');
+        LPSTR slash = strrchr(path, '\\');
         if (slash)
-        {
-            DWORD dir = (DWORD)(slash - filename);
-            memcpy(path, filename, dir);
-            strcpy(path + dir, "\\otvdm_config_report.log");
-        }
+            strcpy(slash + 1, "otvdm_config_report.log");
+        else
+            path[0] = 0;
     }
-    LeaveCriticalSection(&critical_section);
-    if (!path[0])
-        GetModuleFileNameA(GetModuleHandleA(NULL), path, MAX_PATH);
     if (path[0])
         config_report_stream = fopen(path, "a");
     if (!config_report_stream)
@@ -57,12 +74,24 @@ static void config_report_open(void)
 void config_report_enable_check(void)
 {
     CHAR buf[16];
+    CHAR env[16];
     DWORD len;
 
     if (!init)
         init_config();
     if (config_report_enabled)
         return;
+    /* the launcher already parsed [otvdm] ConfigReport before krnl386 was
+     * loaded (see otvdm/config_report.c); honour its decision so the two
+     * halves of the report always agree */
+    if (launcher_report_enabled())
+    {
+        config_report_enabled = TRUE;
+        config_report_open();
+        fprintf(config_report_stream, "otvdm: ---- krnl386 config report enabled (mirrored from launcher) ----\n");
+        fflush(config_report_stream);
+        return;
+    }
     EnterCriticalSection(&critical_section);
     len = GetPrivateProfileStringA("otvdm", "ConfigReport", "0", buf, sizeof(buf), filename);
     LeaveCriticalSection(&critical_section);
@@ -71,6 +100,17 @@ void config_report_enable_check(void)
         config_report_enabled = TRUE;
         config_report_open();
         fprintf(config_report_stream, "otvdm: ---- config report enabled ([otvdm] ConfigReport=%s) ----\n", buf);
+        fflush(config_report_stream);
+        return;
+    }
+    /* OTVDM_CONFIG_REPORT env var works regardless of whether otvdm.ini was
+     * found, so a missing/unreadable ini can still be diagnosed */
+    len = GetEnvironmentVariableA("OTVDM_CONFIG_REPORT", env, sizeof(env));
+    if (len && (atoi(env) || !lstrcmpiA(env, "TRUE") || !lstrcmpiA(env, "yes")))
+    {
+        config_report_enabled = TRUE;
+        config_report_open();
+        fprintf(config_report_stream, "otvdm: ---- config report enabled (env OTVDM_CONFIG_REPORT=%s) ----\n", env);
         fflush(config_report_stream);
     }
 }
@@ -107,6 +147,13 @@ void init_config(void)
     CHAR inienv[MAX_PATH];
     DWORD len;
 
+    /* NOTE: 'init' must be set before any recursive lookup below, and the
+     * critical section must exist before we touch it; a previous version
+     * re-entered init_config() via config_report_enable_check ->
+     * krnl386_get_config_string, which would double-initialize the
+     * critical section. */
+    if (init)
+        return;
     init = TRUE;
     InitializeCriticalSection(&critical_section);
     EnterCriticalSection(&critical_section);
@@ -158,7 +205,9 @@ DWORD WINAPI krnl386_get_config_string(LPCSTR appname, LPCSTR keyname, LPCSTR de
     EnterCriticalSection(&critical_section);
     result = GetPrivateProfileStringA(appname, keyname, def, ret, size, filename);
     LeaveCriticalSection(&critical_section);
-    if (config_report_enabled)
+    /* don't report our own bookkeeping lookups (avoids recursion into the
+     * enable check when it reads [otvdm] ConfigReport itself) */
+    if (config_report_enabled && !(appname && keyname && !lstrcmpiA(appname, "otvdm") && !lstrcmpiA(keyname, "ConfigReport")))
         config_report_lookup(appname, keyname, result ? ret : def, result != 0);
     return result;
 }

@@ -12,6 +12,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="winevdm.c" />
+    <ClCompile Include="config_report.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="resource.h" />
