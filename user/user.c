@@ -1607,7 +1607,26 @@ INT16 WINAPI GetSystemMetrics16( INT16 index )
     if (fix_screen_size && (index == SM_CXSCREEN || index == SM_CYSCREEN))
     {
         RECT point;
-        if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &point, FALSE))
+        /* Multi-monitor: SPI_GETWORKAREA always reports the *primary* monitor's
+         * work area. Use a context-aware monitor lookup instead so that the
+         * virtual desktop metrics follow the monitor the emulator is actually
+         * running on (e.g. a portrait secondary display). */
+        POINT pt = { 0, 0 };
+        GetCursorPos(&pt);
+        HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi = { sizeof(mi) };
+        if (hMon && GetMonitorInfoA(hMon, &mi) &&
+            !(mi.dwFlags & MONITORINFOF_PRIMARY))
+        {
+            point = mi.rcWork;
+        }
+        else if (!SystemParametersInfoA(SPI_GETWORKAREA, 0, &point, FALSE))
+        {
+            point.left = point.top = point.right = point.bottom = 0;
+            point.right = GetSystemMetrics(SM_CXSCREEN);
+            point.bottom = GetSystemMetrics(SM_CYSCREEN);
+        }
+        if (point.right > point.left && point.bottom > point.top)
         {
             if (index == SM_CXSCREEN)
             {
@@ -3954,6 +3973,38 @@ BOOL16 WINAPI SystemParametersInfo16( UINT16 uAction, UINT16 uParam,
     case SPI_GETWORKAREA:
     {
 	RECT tmp;
+        /* Multi-monitor: SPI_GETWORKAREA reports only the primary monitor's
+         * work area. When FixScreenSize is enabled, report the work area of
+         * the monitor the emulator is actually running on instead, so that
+         * 16-bit apps laying out their launch frame from this value honor a
+         * secondary (e.g. portrait) display. */
+        if (krnl386_get_config_int("otvdm", "FixScreenSize", FALSE))
+        {
+            POINT pt = { 0, 0 };
+            HMONITOR hMon = NULL;
+            MONITORINFOA mi = { sizeof(mi) };
+            HWND hwnd = GetForegroundWindow();
+            if (!hwnd) hwnd = GetActiveWindow();
+            if (hwnd && IsWindow(hwnd))
+                hMon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            if (!hMon && GetCursorPos(&pt))
+                hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            if (hMon && GetMonitorInfoA(hMon, &mi) &&
+                !(mi.dwFlags & MONITORINFOF_PRIMARY))
+            {
+                tmp = mi.rcWork;
+                ret = TRUE;
+                if (lpvParam)
+                {
+                    RECT16 *r16 = lpvParam;
+                    r16->left   = tmp.left;
+                    r16->top    = tmp.top;
+                    r16->right  = tmp.right;
+                    r16->bottom = tmp.bottom;
+                }
+                break;
+            }
+        }
 	ret = SystemParametersInfoA( uAction, uParam, lpvParam ? &tmp : NULL, fuWinIni );
 	if (ret && lpvParam)
         {

@@ -1144,6 +1144,40 @@ LRESULT WINAPI DesktopDCEmulationWindowProc(HWND hwnd, UINT msg, WPARAM wparam, 
 }
 static HWND dcemu_hwnd;
 static COLORREF DWMDesktopDCFixBackgroundColor = RGB(254, 254, 254);
+
+/* Multi-monitor fix: SPI_GETWORKAREA always returns the *primary* monitor's
+ * work area, which traps the emulated desktop canvas inside the primary
+ * screen footprint even when the app runs on a secondary display.
+ * Resolve the work area of the monitor the emulator is actually living on
+ * (MonitorFromWindow on our own process window / foreground window, falling
+ * back to MonitorFromPoint on the cursor), and only fall back to
+ * SPI_GETWORKAREA when that lookup fails. */
+static BOOL get_active_workarea(RECT *rc)
+{
+    HMONITOR hMon = NULL;
+    MONITORINFO mi = { sizeof(mi) };
+    HWND hwnd = GetForegroundWindow();
+    POINT pt;
+
+    if (!hwnd) hwnd = GetActiveWindow();
+    if (hwnd && IsWindow(hwnd))
+        hMon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!hMon && GetCursorPos(&pt))
+        hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    if (hMon && GetMonitorInfoW(hMon, &mi))
+    {
+        *rc = mi.rcWork;
+        return TRUE;
+    }
+    if (SystemParametersInfoW(SPI_GETWORKAREA, 0, rc, 0) &&
+        rc->right > rc->left && rc->bottom > rc->top)
+        return TRUE;
+    rc->left = rc->top = 0;
+    rc->right = GetSystemMetrics(SM_CXSCREEN);
+    rc->bottom = GetSystemMetrics(SM_CYSCREEN);
+    return FALSE;
+}
+
 void init_dcemu()
 {
     WNDCLASSW wc = { 0 };
@@ -1158,7 +1192,7 @@ void init_dcemu()
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
     wc.lpszClassName = L"DesktopDCEmulation";
     RegisterClassW(&wc);
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wkara, 0);
+    get_active_workarea(&wkara);
     hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST, L"DesktopDCEmulation", L"", 0, wkara.left, wkara.top, wkara.right - wkara.left, wkara.bottom - wkara.top, NULL, NULL, NULL, NULL);
     if (!hwnd)
         return;
