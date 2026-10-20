@@ -8,6 +8,8 @@ static BOOL init;
 static CHAR filename[MAX_PATH];
 static CRITICAL_SECTION critical_section;
 
+void init_config(void);
+
 /* config report: when enabled (otvdm.ini [otvdm] ConfigReport=1) we print
  * the ini path and every setting lookup so users can verify otvdm.ini is
  * found and which values are read before launching a win16 app. */
@@ -20,9 +22,34 @@ DWORD WINAPI krnl386_get_config_int(LPCSTR appname, LPCSTR keyname, INT def);
 
 static void config_report_open(void)
 {
+    CHAR path[MAX_PATH];
+    DWORD len;
+
     if (config_report_stream)
         return;
-    config_report_stream = fopen("otvdm_config_report.log", "a");
+    /* put the report next to otvdm.exe (the exe directory is already known
+     * at this point, or fall back to the module path directly); if that
+     * location isn't writable (e.g. Program Files) fall back to the current
+     * directory and finally stderr, so the report is never silently lost */
+    path[0] = 0;
+    EnterCriticalSection(&critical_section);
+    if (filename[0])
+    {
+        LPSTR slash = strrchr(filename, '\\');
+        if (slash)
+        {
+            DWORD dir = (DWORD)(slash - filename);
+            memcpy(path, filename, dir);
+            strcpy(path + dir, "\\otvdm_config_report.log");
+        }
+    }
+    LeaveCriticalSection(&critical_section);
+    if (!path[0])
+        GetModuleFileNameA(GetModuleHandleA(NULL), path, MAX_PATH);
+    if (path[0])
+        config_report_stream = fopen(path, "a");
+    if (!config_report_stream)
+        config_report_stream = fopen("otvdm_config_report.log", "a");
     if (!config_report_stream)
         config_report_stream = stderr;
 }
