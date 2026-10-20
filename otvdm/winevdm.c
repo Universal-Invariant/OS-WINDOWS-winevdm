@@ -37,6 +37,7 @@
 WINE_DEFAULT_DEBUG_CHANNEL(winevdm);
 
 extern void __wine_load_dos_exe( LPCSTR filename, LPCSTR cmdline );
+void config_report_launch(LPCSTR appname);
 
 /***********************************************************************
  *           build_command_line
@@ -904,6 +905,7 @@ int entry_point( int argc, char *argv[] )
         BOOL res = ActivateActCtx(result, &lpCookie);
     }
 
+    config_report_launch( appname );
     exec16(params, appname, cmdline, TRUE);
     /* wait forever; the process will be killed when the last task exits */
     ReleaseThunkLock(&count);
