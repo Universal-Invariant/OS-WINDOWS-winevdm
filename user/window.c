@@ -910,44 +910,42 @@ BOOL16 WINAPI ShowWindow16( HWND16 hwnd16, INT16 cmd )
     /* [otvdm] PreferredMonitor: reproduce "make this my main display".
      * The metric layer already reports the preferred monitor's LOGICAL work
      * area to the 16-bit app (user.c). But Windows maximizes a top-level
-     * window onto whatever monitor it currently occupies -- using THAT
-     * monitor's own metrics -- so an app on the primary would maximize to
-     * the primary's size. Here we take the app's intended logical maximize
-     * rect (the corrected work rect), translate it to PHYSICAL pixels for
-     * the preferred monitor, apply it as a restore geometry anchored on
-     * that monitor, and then let Windows maximize: DWM recomputes the
-     * maximize rect from the monitor the window now sits on, which is the
-     * preferred one. Result: frame lands exactly on the chosen display at
-     * its native scale, and the app lays out children against the matching
-     * logical metrics. Only top-level windows are touched; when the option
-     * is off or unresolvable this block does nothing. */
+     * window onto whatever monitor it currently occupies using THAT monitor's
+     * own metrics; an untouched maximize therefore filled the primary at the
+     * wrong size and pushed child controls outside the visible client. Here we
+     * pre-place the frame at the preferred monitor's PHYSICAL work rect (the
+     * coordinate space this process' own Win32 calls use), then let Windows
+     * maximize: DWM recomputes the maximize rect from the monitor the window
+     * now sits on -- the preferred one -- with matching geometry, so the
+     * stretched bitmap covers exactly that panel and the app's logical layout
+     * lines up 1:1. Only top-level windows are touched; when the option is
+     * off or unresolvable this block does nothing. */
     if ((cmd == SW_SHOWMAXIMIZED || cmd == SW_MAXIMIZE) &&
         !GetParent( hwnd ) && !(GetWindowLongA( hwnd, GWL_STYLE ) & WS_CHILD))
     {
         RECT pmwork;
         HMONITOR pm = NULL;
         float pmdiv = 1.0f;
+        MONITORINFO mi = { sizeof(mi) };
         if (preferred_monitor_work_rect( &pmwork, &pm, &pmdiv ))
         {
-            /* preferred_monitor_work_rect returns the target work area in the
-             * SAME coordinate space this process' own Win32 calls use (sizes
-             * unscaled for bitmap virtualization, origin rebased against the
-             * primary's stretch anchor). Pass it straight to SetWindowPos --
-             * multiplying by pmdiv again was the bug that made the frame
-             * 1.25x too large and pushed controls outside the client. */
+            INT px, py, pcx, pcy;
             INT lw = pmwork.right - pmwork.left, lh = pmwork.bottom - pmwork.top;
-            INT px = pmwork.left, py = pmwork.top;
-            INT pcx = lw, pcy = lh;
-            DWORD fs = GetWindowStyle( hwnd );
+            DWORD st = GetWindowStyle( hwnd );
             BOOL wasMin = IsIconic( hwnd );
+            if (!GetMonitorInfoA( pm, &mi )) mi.rcWork = pmwork;
+            px  = mi.rcWork.left;
+            py  = mi.rcWork.top;
+            pcx = mi.rcWork.right  - mi.rcWork.left;
+            pcy = mi.rcWork.bottom - mi.rcWork.top;
             ReleaseThunkLock(&count);
             if (wasMin) ShowWindow( hwnd, SW_RESTORE );
-            SetWindowLongA( hwnd, GWL_STYLE, fs & ~WS_MAXIMIZE );
+            SetWindowLongA( hwnd, GWL_STYLE, st & ~WS_MAXIMIZE );
             SetWindowPos( hwnd, NULL, px, py, pcx, pcy,
                           SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW );
-            SetWindowLongA( hwnd, GWL_STYLE, fs );   /* restore style bits */
-            config_report_note( "ShowWindow16(PM): logical(%d,%d %dx%d) -> phys(%d,%d %dx%d) mon %p before maximize",
-                                lx, ly, lw, lh, px, py, pcx, pcy, (void*)pm );
+            SetWindowLongA( hwnd, GWL_STYLE, st );   /* restore style bits */
+            config_report_note( "ShowWindow16(PM): logical(%dx%d) -> place(%d,%d %dx%d) mon %p before maximize",
+                                lw, lh, px, py, pcx, pcy, (void*)pm );
             RestoreThunkLock(count);
         }
     }
@@ -2441,6 +2439,29 @@ BOOL16 WINAPI SetWindowPos16( HWND16 hwnd, HWND16 hwndInsertAfter,
         INT ix = x, iy = y;
         INT cx32 = cx, cy32 = cy;
         fix_screen_clamp_maximized_rect( hwnd32, &ix, &iy, &cx32, &cy32 );
+        /* PreferredMonitor: the app requested LOGICAL geometry sized from the
+         * target monitor's reported work area, but Windows answers SetWindowPos
+         * in this process' own coordinate space and maximizes using the PHYSICAL
+         * monitor rect -- so near-fullscreen top-level requests landed on the
+         * primary at the wrong scale (frame too large, controls spilled outside
+         * the visible client). Place such frames directly at the preferred
+         * monitor's physical work rect instead. */
+        {
+            RECT pw; HMONITOR pm = NULL; float pd = 1.0f;
+            MONITORINFO mi = { sizeof(mi) };
+            if (preferred_monitor_work_rect( &pw, &pm, &pd ) &&
+                GetMonitorInfoA( pm, &mi ) &&
+                cx32 >= (INT)(pw.right - pw.left) * 95 / 100 &&
+                cy32 >= (INT)(pw.bottom - pw.top) * 85 / 100)
+            {
+                ix   = mi.rcWork.left;
+                iy   = mi.rcWork.top;
+                cx32 = mi.rcWork.right  - mi.rcWork.left;
+                cy32 = mi.rcWork.bottom - mi.rcWork.top;
+                config_report_note( "SetWindowPos16(PM): req(%d,%d %dx%d) -> place(%d,%d %dx%d) mon %p",
+                                    x, y, cx, cy, ix, iy, cx32, cy32, (void*)pm );
+            }
+        }
         x = (INT16)ix; y = (INT16)iy; cx = (INT16)cx32; cy = (INT16)cy32;
     }
     /* [otvdm] PreferredMonitor: a Win16 app never chooses a monitor -- it
