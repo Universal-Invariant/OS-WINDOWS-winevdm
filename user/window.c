@@ -889,6 +889,45 @@ BOOL16 WINAPI ShowWindow16( HWND16 hwnd16, INT16 cmd )
         return TRUE;
     }
 
+    /* [otvdm] PreferredMonitor: a Win16 app never chooses a monitor; when it
+     * maximizes, Windows snaps the frame to whichever monitor the window is
+     * currently on. If that isn't the preferred display, move it there first
+     * (centered inside the target work area) and let Windows maximize onto
+     * it -- this reproduces "make this my main display" without touching the
+     * user's display settings. Only top-level windows are touched. */
+    if ((cmd == SW_SHOWMAXIMIZED || cmd == SW_MAXIMIZE) &&
+        !GetParent( hwnd ) && !(GetWindowLongA( hwnd, GWL_STYLE ) & WS_CHILD))
+    {
+        RECT pmwork;
+        HMONITOR pm = NULL;
+        if (preferred_monitor_work_rect( &pmwork, &pm ))
+        {
+            MONITORINFO mi = { sizeof(mi) };
+            HMONITOR cur = MonitorFromWindow( hwnd, MONITOR_DEFAULTTONEAREST );
+            if (cur != pm && GetMonitorInfoA( pm, &mi ))
+            {
+                RECT wr;
+                INT w = 0, h = 0;
+                if (GetWindowRect( hwnd, &wr ))
+                {
+                    w = wr.right - wr.left;
+                    h = wr.bottom - wr.top;
+                }
+                if (w < 200 || w > (mi.rcWork.right - mi.rcWork.left)) w = (mi.rcWork.right - mi.rcWork.left) / 2;
+                if (h < 100 || h > (mi.rcWork.bottom - mi.rcWork.top)) h = (mi.rcWork.bottom - mi.rcWork.top) / 2;
+                {
+                    INT nx = mi.rcWork.left + ((mi.rcWork.right  - mi.rcWork.left)  - w) / 2;
+                    INT ny = mi.rcWork.top  + ((mi.rcWork.bottom - mi.rcWork.top)   - h) / 2;
+                    ReleaseThunkLock(&count);
+                    SetWindowPos( hwnd, NULL, nx, ny, w, h, SWP_NOZORDER | SWP_NOMINMAXREC );
+                    config_report_note( "ShowWindow16(PM): moved win from mon %p to preferred work L%d T%d R%d B%d at (%d,%d %dx%d) before maximize",
+                                        (void*)cur, mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom, nx, ny, w, h );
+                    RestoreThunkLock(count);
+                }
+            }
+        }
+    }
+
     ReleaseThunkLock(&count);
 #ifdef ATTACH_THREAD_INPUT
     DWORD foregroundID = GetWindowThreadProcessId(GetForegroundWindow(), NULL);

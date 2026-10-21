@@ -201,6 +201,155 @@ static float fix_screen_monitor_divisor( HMONITOR hMon )
     }
 }
 
+static void config_report_note( LPCSTR fmt, ... );   /* fwd decl: defined below */
+
+/* ------------------------------------------------------------------------
+ * [otvdm] PreferredMonitor  (monitor selection without touching Windows
+ * display settings)
+ *
+ * User observation: flipping "Make this my main display" in Windows to the
+ * other monitor makes OSCAR come up at the right size.  The Win16 app never
+ * picks a monitor itself -- it lays out against whatever SM_CXSCREEN /
+ * SPI_GETWORKAREA return, and for an unaware process those are the PRIMARY
+ * monitor's metrics.  So instead of asking Windows to change the primary,
+ * we make the metric layer report the work area of a chosen monitor, and
+ * (window.c) anchor/force top-level windows onto that same monitor.
+ *
+ * Value in otvdm.ini [otvdm] section, one of:
+ *   PreferredMonitor=N       N = 0-based index into the monitor list exactly
+ *                            as printed by the ConfigReport "monitor[N]:"
+ *                            snapshot lines (run once with ConfigReport=1 to
+ *                            find the index of the target display).
+ *   PreferredMonitor=<text>  case-sensitive substring matched against the
+ *                            device name (\.\DISPLAY2 etc.).
+ * Unset/empty = feature off; all touched code paths behave exactly like the
+ * previous build (FixScreenSize/ForceScreen* semantics unchanged).
+ * Cached after first successful lookup; re-resolved if the layout changes
+ * (handle becomes stale -> next call retries).
+ * ------------------------------------------------------------------------ */
+
+typedef struct
+{
+    INT  want_index;         /* >=0: match by position in EnumDisplayMonitors order */
+    const char *want_name;   /* !=NULL: substring match vs miex.szDevice          */
+    INT  seen;               /* running enumeration counter                       */
+    HMONITOR hMon;           /* result                                            */
+    RECT bounds, work;       /* physical pixels                                   */
+    char devname[32];
+    BOOL found;
+} pref_mon_ctx;
+
+static BOOL CALLBACK pref_mon_enum_cb( HMONITOR hMon, HDC hdc, LPRECT rc, LPARAM lp )
+{
+    pref_mon_ctx *ctx = (pref_mon_ctx *)lp;
+    MONITORINFOEXA mi;
+
+    ZeroMemory( &mi, sizeof(mi) );
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoA( hMon, (MONITORINFO *)&mi ))
+        return TRUE;
+
+    if (ctx->want_index >= 0)
+    {
+        if (ctx->seen++ != ctx->want_index) return TRUE;
+    }
+    else
+    {
+        if (!strstr( mi.szDevice, ctx->want_name )) return TRUE;
+    }
+    ctx->hMon   = hMon;
+    ctx->bounds = mi.rcMonitor;
+    ctx->work   = mi.rcWork;
+    lstrcpynA( ctx->devname, mi.szDevice, sizeof(ctx->devname) );
+    ctx->found  = TRUE;
+    return FALSE;                 /* stop enumerating */
+}
+
+static HMONITOR  pref_mon_hmon;
+static RECT      pref_mon_work;    /* physical work rect of preferred monitor */
+static BOOL      pref_mon_active;  /* resolved + usable */
+static BOOL      pref_mon_tried;
+static BOOL      pref_mon_enabled;
+static INT       pref_mon_index = -1;
+static char      pref_mon_name[32];
+
+static BOOL pref_mon_resolve( void )
+{
+    pref_mon_ctx ctx;
+
+    if (!pref_mon_enabled) return FALSE;
+    ZeroMemory( &ctx, sizeof(ctx) );
+    ctx.want_index = pref_mon_index;
+    ctx.want_name  = pref_mon_name[0] ? pref_mon_name : NULL;
+    EnumDisplayMonitors( NULL, NULL, pref_mon_enum_cb, (LPARAM)&ctx );
+    if (!ctx.found)
+    {
+        static BOOL warned;
+        if (!warned)
+        {
+            warned = TRUE;
+            config_report_note( "PreferredMonitor: value '%s' matched no monitor -- option ignored",
+                                pref_mon_index >= 0 ? "(numeric)" : pref_mon_name );
+        }
+        pref_mon_enabled = FALSE;   /* bad value: don't retry per call */
+        return FALSE;
+    }
+    pref_mon_hmon   = ctx.hMon;
+    pref_mon_work   = ctx.work;
+    pref_mon_active = TRUE;
+    config_report_note( "PreferredMonitor: using '%s' bounds L%d T%d R%d B%d (%dx%d) work L%d T%d R%d B%d (%dx%d)",
+                        ctx.devname,
+                        ctx.bounds.left, ctx.bounds.top, ctx.bounds.right, ctx.bounds.bottom,
+                        ctx.bounds.right - ctx.bounds.left, ctx.bounds.bottom - ctx.bounds.top,
+                        ctx.work.left, ctx.work.top, ctx.work.right, ctx.work.bottom,
+                        ctx.work.right - ctx.work.left, ctx.work.bottom - ctx.work.top );
+    return TRUE;
+}
+
+static void pref_mon_init( void )
+{
+    char raw[64];
+    char *endp;
+
+    if (pref_mon_tried) return;
+    pref_mon_tried = TRUE;
+    raw[0] = 0;
+    krnl386_get_config_string( "otvdm", "PreferredMonitor", "", raw, sizeof(raw) );
+    if (!raw[0]) return;
+    pref_mon_index = strtol( raw, &endp, 10 );
+    if (endp != raw && *endp == 0)         /* pure number: monitor index */
+    {
+        if (pref_mon_index < 0) pref_mon_index = 0;
+    }
+    else                                    /* text: device-name substring */
+    {
+        pref_mon_index = -1;
+        lstrcpynA( pref_mon_name, raw, sizeof(pref_mon_name) );
+    }
+    pref_mon_enabled = TRUE;
+    pref_mon_resolve();
+}
+
+/* Public: TRUE and *out = PHYSICAL work rect when PreferredMonitor is set
+ * and resolved. Caller applies DPI unscale itself (via the handle). */
+BOOL WINAPI preferred_monitor_work_rect( RECT *out, HMONITOR *phMon )
+{
+    pref_mon_init();
+    if (!pref_mon_active) return FALSE;
+    /* cheap staleness check: handles go dead on layout change */
+    {
+        MONITORINFO mi = { sizeof(mi) };
+        if (!GetMonitorInfoA( pref_mon_hmon, &mi ))
+        {
+            pref_mon_active = FALSE;
+            if (!pref_mon_resolve()) return FALSE;
+        }
+    }
+    if (out)   *out   = pref_mon_work;
+    if (phMon) *phMon = pref_mon_hmon;
+    return TRUE;
+}
+
 static void config_report_note( LPCSTR fmt, ... )
 {
     static config_report_note_t pfn_note;
@@ -1799,6 +1948,16 @@ static BOOL get_fix_screen_work_rect_ex( RECT *out, HMONITOR *phMon )
     MONITORINFO mi = { sizeof(mi) };
 
     ZeroMemory( out, sizeof(*out) );
+    /* [otvdm] PreferredMonitor overrides everything: report the chosen
+     * monitor's work area (physical pixels here; unscaled below), exactly
+     * reproducing what Windows would return if that display were made the
+     * primary -- without touching the user's display settings. */
+    if (preferred_monitor_work_rect( out, &hMon ))
+    {
+        fix_screen_rect_unscale( out, fix_screen_monitor_divisor( hMon ) );
+        if (phMon) *phMon = hMon;
+        return (out->right > out->left && out->bottom > out->top);
+    }
     GetCursorPos( &pt );
     hMon = MonitorFromPoint( pt, MONITOR_DEFAULTTONEAREST );
     if (hMon && GetMonitorInfoA( hMon, &mi ) &&
@@ -1991,8 +2150,24 @@ void WINAPI force_screen_client_size( HWND hwnd32, const INT *pref_w, const INT 
     if (fw < 1) fw = 1;
     if (fh < 1) fh = 1;
 
-    /* Anchor at the work-area origin of the monitor hosting the window, in
-     * the logical space the 16-bit world operates in. */
+    /* Anchor at the work-area origin, in the logical space the 16-bit world
+     * operates in. PreferredMonitor wins over "monitor hosting the window":
+     * with ForceScreen* + PreferredMonitor combined, every forced top-level
+     * lands on the chosen display. */
+    {
+        RECT pmwork;
+        HMONITOR pmh = NULL;
+        if (preferred_monitor_work_rect( &pmwork, &pmh ))
+        {
+            RECT work = pmwork;   /* physical */
+            fix_screen_rect_unscale( &work, fix_screen_monitor_divisor( pmh ) );
+            *out_x = work.left;   /* already physical: assign directly */
+            *out_y = work.top;
+            *out_cx = (INT)(fw * div) + border_x;
+            *out_cy = (INT)(fh * div) + border_y;
+            return;
+        }
+    }
     hMon = MonitorFromWindow( hwnd32, MONITOR_DEFAULTTONEAREST );
     if (hMon && GetMonitorInfoA( hMon, &mi ))
     {
@@ -4457,7 +4632,31 @@ BOOL16 WINAPI SystemParametersInfo16( UINT16 uAction, UINT16 uParam,
          * work area. When FixScreenSize is enabled, report the work area of
          * the monitor the emulator is actually running on instead, so that
          * 16-bit apps laying out their launch frame from this value honor a
-         * secondary (e.g. portrait) display. */
+         * secondary (e.g. portrait) display.
+         * PreferredMonitor overrides the monitor choice entirely: the chosen
+         * display's work rect is reported regardless of where the cursor or
+         * foreground window happens to be -- this is what reproduces the
+         * "make it my main display" behavior inside otvdm. */
+        {
+            RECT pmwork;
+            HMONITOR pm = NULL;
+            if (!preferred_monitor_work_rect( &pmwork, &pm )) break;   /* unreachable, defensive */
+            tmp = pmwork;   /* physical work rect of the preferred monitor */
+            fix_screen_rect_unscale( &tmp, fix_screen_monitor_divisor( pm ) );
+            ret = TRUE;
+            if (lpvParam)
+            {
+                RECT16 *r16 = lpvParam;
+                r16->left   = tmp.left;
+                r16->top    = tmp.top;
+                r16->right  = tmp.right;
+                r16->bottom = tmp.bottom;
+            }
+            config_report_note( "SPI_GETWORKAREA(PreferredMonitor): rect L%d T%d R%d B%d (%dx%d)",
+                                (int)tmp.left, (int)tmp.top, (int)tmp.right, (int)tmp.bottom,
+                                (int)(tmp.right - tmp.left), (int)(tmp.bottom - tmp.top) );
+            break;
+        }
         if (krnl386_get_config_int("otvdm", "FixScreenSize", FALSE))
         {
             POINT pt = { 0, 0 };

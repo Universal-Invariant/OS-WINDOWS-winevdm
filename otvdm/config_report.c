@@ -199,6 +199,7 @@ static void cfg_init( void )
     static const CHAR *keys[] = {
         "ConfigReport", "FixScreenSize", "DIBPalette", "EnableVisualStyle",
         "DefaultInstallDir", "UseGlobalLocal", "SharedWow", "ConsoleBuffer",
+        "PreferredMonitor",
     };
 
     if (cfg_init_done) return;

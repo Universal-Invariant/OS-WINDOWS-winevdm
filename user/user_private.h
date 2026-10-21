@@ -133,6 +133,7 @@ extern HICON16 get_icon_16( HICON icon ) DECLSPEC_HIDDEN;
  * used from window.c on the SetWindowPos16/ShowWindow16/CreateWindowEx16
  * paths). See user.c for documentation of each function. */
 extern BOOL WINAPI fix_screen_clamp_maximized_rect( HWND hwnd32, LPINT px, LPINT py, LPINT pcx, LPINT pcy ) DECLSPEC_HIDDEN;
+extern BOOL WINAPI preferred_monitor_work_rect( RECT *out, HMONITOR *phMon ) DECLSPEC_HIDDEN;
 extern BOOL WINAPI force_screen_size_enabled(void) DECLSPEC_HIDDEN;
 /* WINAPI (__stdcall) pins the linker symbol name (_force_screen_sizes@8) so
  * it matches between user.c and window.c even if a translation unit or an
