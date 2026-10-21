@@ -929,12 +929,15 @@ BOOL16 WINAPI ShowWindow16( HWND16 hwnd16, INT16 cmd )
         float pmdiv = 1.0f;
         if (preferred_monitor_work_rect( &pmwork, &pm, &pmdiv ))
         {
-            /* app-space (logical) work rect of the preferred monitor */
-            INT lx = pmwork.left, ly = pmwork.top;
+            /* preferred_monitor_work_rect returns the target work area in the
+             * SAME coordinate space this process' own Win32 calls use (sizes
+             * unscaled for bitmap virtualization, origin rebased against the
+             * primary's stretch anchor). Pass it straight to SetWindowPos --
+             * multiplying by pmdiv again was the bug that made the frame
+             * 1.25x too large and pushed controls outside the client. */
             INT lw = pmwork.right - pmwork.left, lh = pmwork.bottom - pmwork.top;
-            /* physical destination rect on the preferred monitor */
-            INT px = (INT)(lx * pmdiv), py = (INT)(ly * pmdiv);
-            INT pcx = (INT)(lw * pmdiv), pcy = (INT)(lh * pmdiv);
+            INT px = pmwork.left, py = pmwork.top;
+            INT pcx = lw, pcy = lh;
             DWORD fs = GetWindowStyle( hwnd );
             BOOL wasMin = IsIconic( hwnd );
             ReleaseThunkLock(&count);
