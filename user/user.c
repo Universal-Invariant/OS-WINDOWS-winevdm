@@ -332,7 +332,7 @@ static void pref_mon_init( void )
 
 /* Public: TRUE and *out = PHYSICAL work rect when PreferredMonitor is set
  * and resolved. Caller applies DPI unscale itself (via the handle). */
-BOOL WINAPI preferred_monitor_work_rect( RECT *out, HMONITOR *phMon )
+BOOL WINAPI preferred_monitor_work_rect( RECT *out, HMONITOR *phMon, float *pfDiv )
 {
     pref_mon_init();
     if (!pref_mon_active) return FALSE;
@@ -347,6 +347,12 @@ BOOL WINAPI preferred_monitor_work_rect( RECT *out, HMONITOR *phMon )
     }
     if (out)   *out   = pref_mon_work;
     if (phMon) *phMon = pref_mon_hmon;
+    /* Physical->logical divisor for THIS monitor. Exported so window.c can
+     * translate the app's logical geometry back to physical pixels when it
+     * relocates top-level windows onto the preferred display (a DPI-unaware
+     * process receives physical coordinates from the thunk layer and hands
+     * them straight to SetWindowPos). */
+    if (pfDiv) *pfDiv = fix_screen_monitor_divisor( pref_mon_hmon );
     return TRUE;
 }
 
@@ -1952,7 +1958,7 @@ static BOOL get_fix_screen_work_rect_ex( RECT *out, HMONITOR *phMon )
      * monitor's work area (physical pixels here; unscaled below), exactly
      * reproducing what Windows would return if that display were made the
      * primary -- without touching the user's display settings. */
-    if (preferred_monitor_work_rect( out, &hMon ))
+    if (preferred_monitor_work_rect( out, &hMon, NULL ))
     {
         fix_screen_rect_unscale( out, fix_screen_monitor_divisor( hMon ) );
         if (phMon) *phMon = hMon;
@@ -2157,7 +2163,7 @@ void WINAPI force_screen_client_size( HWND hwnd32, const INT *pref_w, const INT 
     {
         RECT pmwork;
         HMONITOR pmh = NULL;
-        if (preferred_monitor_work_rect( &pmwork, &pmh ))
+        if (preferred_monitor_work_rect( &pmwork, &pmh, NULL ))
         {
             RECT work = pmwork;   /* physical */
             fix_screen_rect_unscale( &work, fix_screen_monitor_divisor( pmh ) );
@@ -4640,7 +4646,7 @@ BOOL16 WINAPI SystemParametersInfo16( UINT16 uAction, UINT16 uParam,
         {
             RECT pmwork;
             HMONITOR pm = NULL;
-            if (!preferred_monitor_work_rect( &pmwork, &pm )) break;   /* unreachable, defensive */
+            if (!preferred_monitor_work_rect( &pmwork, &pm, NULL )) break;   /* unreachable, defensive */
             tmp = pmwork;   /* physical work rect of the preferred monitor */
             fix_screen_rect_unscale( &tmp, fix_screen_monitor_divisor( pm ) );
             ret = TRUE;

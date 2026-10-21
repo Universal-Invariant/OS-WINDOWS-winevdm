@@ -887,6 +887,18 @@ BOOL16 WINAPI ShowWindow16( HWND16 hwnd16, INT16 cmd )
         ReleaseThunkLock(&count);
         ShowWindow( hwnd, SW_RESTORE );
         force_screen_client_size( hwnd, &fw, &fh, &x, &y, &cx, &cy );
+        /* PreferredMonitor + ForceScreen*: force_screen_client_size returns
+         * logical coords anchored at the preferred work rect origin, but
+         * Win32 SetWindowPos below needs PHYSICAL pixels. Translate size and
+         * position by the target monitor's divisor (identity at 100%). */
+        {
+            RECT pmwork; HMONITOR pm = NULL; float pmdiv = 1.0f;
+            if (preferred_monitor_work_rect( &pmwork, &pm, &pmdiv ) && pmdiv > 1.0001f)
+            {
+                x = (INT)(x * pmdiv); y = (INT)(y * pmdiv);
+                cx = (INT)(cx * pmdiv); cy = (INT)(cy * pmdiv);
+            }
+        }
         SetWindowPos( hwnd, NULL, x, y, cx, cy,
                       SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW );
         config_report_note( "ShowWindow16(FS): maximize intercepted -> forced client %dx%d, win rect (%d,%d %dx%d)",
@@ -895,42 +907,45 @@ BOOL16 WINAPI ShowWindow16( HWND16 hwnd16, INT16 cmd )
         return TRUE;
     }
 
-    /* [otvdm] PreferredMonitor: a Win16 app never chooses a monitor; when it
-     * maximizes, Windows snaps the frame to whichever monitor the window is
-     * currently on. If that isn't the preferred display, move it there first
-     * (centered inside the target work area) and let Windows maximize onto
-     * it -- this reproduces "make this my main display" without touching the
-     * user's display settings. Only top-level windows are touched. */
+    /* [otvdm] PreferredMonitor: reproduce "make this my main display".
+     * The metric layer already reports the preferred monitor's LOGICAL work
+     * area to the 16-bit app (user.c). But Windows maximizes a top-level
+     * window onto whatever monitor it currently occupies -- using THAT
+     * monitor's own metrics -- so an app on the primary would maximize to
+     * the primary's size. Here we take the app's intended logical maximize
+     * rect (the corrected work rect), translate it to PHYSICAL pixels for
+     * the preferred monitor, apply it as a restore geometry anchored on
+     * that monitor, and then let Windows maximize: DWM recomputes the
+     * maximize rect from the monitor the window now sits on, which is the
+     * preferred one. Result: frame lands exactly on the chosen display at
+     * its native scale, and the app lays out children against the matching
+     * logical metrics. Only top-level windows are touched; when the option
+     * is off or unresolvable this block does nothing. */
     if ((cmd == SW_SHOWMAXIMIZED || cmd == SW_MAXIMIZE) &&
         !GetParent( hwnd ) && !(GetWindowLongA( hwnd, GWL_STYLE ) & WS_CHILD))
     {
         RECT pmwork;
         HMONITOR pm = NULL;
-        if (preferred_monitor_work_rect( &pmwork, &pm ))
+        float pmdiv = 1.0f;
+        if (preferred_monitor_work_rect( &pmwork, &pm, &pmdiv ))
         {
-            MONITORINFO mi = { sizeof(mi) };
-            HMONITOR cur = MonitorFromWindow( hwnd, MONITOR_DEFAULTTONEAREST );
-            if (cur != pm && GetMonitorInfoA( pm, &mi ))
-            {
-                RECT wr;
-                INT w = 0, h = 0;
-                if (GetWindowRect( hwnd, &wr ))
-                {
-                    w = wr.right - wr.left;
-                    h = wr.bottom - wr.top;
-                }
-                if (w < 200 || w > (mi.rcWork.right - mi.rcWork.left)) w = (mi.rcWork.right - mi.rcWork.left) / 2;
-                if (h < 100 || h > (mi.rcWork.bottom - mi.rcWork.top)) h = (mi.rcWork.bottom - mi.rcWork.top) / 2;
-                {
-                    INT nx = mi.rcWork.left + ((mi.rcWork.right  - mi.rcWork.left)  - w) / 2;
-                    INT ny = mi.rcWork.top  + ((mi.rcWork.bottom - mi.rcWork.top)   - h) / 2;
-                    ReleaseThunkLock(&count);
-                    SetWindowPos( hwnd, NULL, nx, ny, w, h, SWP_NOZORDER | SWP_NOMINMAXREC );
-                    config_report_note( "ShowWindow16(PM): moved win from mon %p to preferred work L%d T%d R%d B%d at (%d,%d %dx%d) before maximize",
-                                        (void*)cur, mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom, nx, ny, w, h );
-                    RestoreThunkLock(count);
-                }
-            }
+            /* app-space (logical) work rect of the preferred monitor */
+            INT lx = pmwork.left, ly = pmwork.top;
+            INT lw = pmwork.right - pmwork.left, lh = pmwork.bottom - pmwork.top;
+            /* physical destination rect on the preferred monitor */
+            INT px = (INT)(lx * pmdiv), py = (INT)(ly * pmdiv);
+            INT pcx = (INT)(lw * pmdiv), pcy = (INT)(lh * pmdiv);
+            DWORD fs = GetWindowStyle( hwnd );
+            BOOL wasMin = IsIconic( hwnd );
+            ReleaseThunkLock(&count);
+            if (wasMin) ShowWindow( hwnd, SW_RESTORE );
+            SetWindowLongA( hwnd, GWL_STYLE, fs & ~WS_MAXIMIZE );
+            SetWindowPos( hwnd, NULL, px, py, pcx, pcy,
+                          SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW );
+            SetWindowLongA( hwnd, GWL_STYLE, fs );   /* restore style bits */
+            config_report_note( "ShowWindow16(PM): logical(%d,%d %dx%d) -> phys(%d,%d %dx%d) mon %p before maximize",
+                                lx, ly, lw, lh, px, py, pcx, pcy, (void*)pm );
+            RestoreThunkLock(count);
         }
     }
 
@@ -2424,6 +2439,38 @@ BOOL16 WINAPI SetWindowPos16( HWND16 hwnd, HWND16 hwndInsertAfter,
         INT cx32 = cx, cy32 = cy;
         fix_screen_clamp_maximized_rect( hwnd32, &ix, &iy, &cx32, &cy32 );
         x = (INT16)ix; y = (INT16)iy; cx = (INT16)cx32; cy = (INT16)cy32;
+    }
+    /* [otvdm] PreferredMonitor: a Win16 app never chooses a monitor -- it
+     * sizes its main frame from SM_CXSCREEN/SPI_GETWORKAREA, which we already
+     * report as the preferred monitor's LOGICAL work rect. But plain Win32
+     * SetWindowPos positions in PHYSICAL desktop pixels, so an untouched
+     * request lands on the primary at the wrong scale (controls spill outside
+     * the client). For top-level resize/move calls whose requested size fills
+     * (or nearly fills) the corrected logical work area, translate the rect to
+     * physical pixels and re-anchor it inside the preferred monitor's physical
+     * bounds. Child controls are left alone: they flow with the parent frame.
+     * No-op when PreferredMonitor is unset or scaling is 100%. */
+    if (!(flags & SWP_NOSIZE) && !fs_forced && hwnd32 == WIN_Handle32(hwnd) &&
+        GetAncestor( hwnd32, GA_PARENT ) == GetDesktopWindow() &&
+        !(GetWindowLongA( hwnd32, GWL_STYLE ) & WS_CHILD))
+    {
+        RECT pmwork; HMONITOR pm = NULL; float pmdiv = 1.0f;
+        MONITORINFO mi = { sizeof(mi) };
+        if (preferred_monitor_work_rect( &pmwork, &pm, &pmdiv ) &&
+            GetMonitorInfoA( pm, &mi ))
+        {
+            INT lw = pmwork.right - pmwork.left, lh = pmwork.bottom - pmwork.top;
+            if (cx >= (INT)(lw * 0.95f) && cy >= (INT)(lh * 0.9f))
+            {
+                INT px = mi.rcWork.left + ((cx - lw) / 2);   /* keep centering of oversize frames */
+                INT py = mi.rcWork.top;
+                if (px < mi.rcMonitor.left) px = mi.rcMonitor.left;
+                if (py < mi.rcMonitor.top)  py = mi.rcMonitor.top;
+                config_report_note( "SetWindowPos16(PM): logical(%d,%d %dx%d) -> phys(%d,%d %dx%d) on mon %p",
+                                    x, y, cx, cy, px, py, cx, cy, (void*)pm );
+                x = (INT16)px; y = (INT16)py;
+            }
+        }
     }
     BOOL16 result = SetWindowPos( hwnd32, full_insert_after_hwnd(hwndInsertAfter),
                          x, y, cx, cy, flags );
