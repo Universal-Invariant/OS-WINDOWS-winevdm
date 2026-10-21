@@ -417,6 +417,33 @@ BOOL preferred_monitor_work_rect( RECT *out, HMONITOR *phMon, float *pfDiv )
     return preferred_monitor_rect( out, phMon, pfDiv );
 }
 
+/* Presentation accessor for window PLACEMENT (window.c): unlike the metric
+ * layer above, Win32 SetWindowPos inside this unaware process operates in a
+ * coordinate space where the PRIMARY monitor is virtualized (logical) but
+ * secondary monitors' rects come back RAW PHYSICAL (proven by CoordSpace
+ * probes: monbounds L-1080 T-231 R0 B1689 = 1080x1920 physical). Passing a
+ * prescaled rect there made Windows maximize onto the primary and stretch
+ * the bitmap 1.25x -- which is exactly why the app looked correct on the
+ * target panel but its client was ~25% too large with controls spilling
+ * outside. So placement must use the target's RAW PHYSICAL work rect with no
+ * scaling applied. Returns FALSE when PreferredMonitor is unset/unresolved. */
+BOOL preferred_monitor_presented_rect( RECT *out, HMONITOR *phMon )
+{
+    pref_mon_init();
+    if (!pref_mon_active) return FALSE;
+    {
+        MONITORINFO mi = { sizeof(mi) };
+        if (!GetMonitorInfoA( pref_mon_hmon, &mi ))
+        {
+            pref_mon_active = FALSE;
+            if (!pref_mon_resolve()) return FALSE;
+        }
+        if (out) *out = mi.rcWork;   /* raw physical, presentation space */
+    }
+    if (phMon) *phMon = pref_mon_hmon;
+    return TRUE;
+}
+
 /* Placement scale factor for handing coordinates to Win32 SetWindowPos from
  * inside this process. The metric layer hands the 16-bit app the LOGICAL
  * work rect (physical/s). Windows then DIVIDES every coord we pass to
@@ -2112,7 +2139,7 @@ static BOOL get_fix_screen_work_rect_ex( RECT *out, HMONITOR *phMon )
     return (out->right > out->left && out->bottom > out->top);
 }
 
-static BOOL get_fix_screen_work_rect( RECT *out )
+BOOL get_fix_screen_work_rect( RECT *out )   /* non-static: window.c compares app-space logical size (PreferredMonitor placement) */
 {
     return get_fix_screen_work_rect_ex( out, NULL );
 }

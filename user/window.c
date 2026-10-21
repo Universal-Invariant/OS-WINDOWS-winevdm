@@ -888,15 +888,28 @@ BOOL16 WINAPI ShowWindow16( HWND16 hwnd16, INT16 cmd )
         ShowWindow( hwnd, SW_RESTORE );
         force_screen_client_size( hwnd, &fw, &fh, &x, &y, &cx, &cy );
         /* PreferredMonitor + ForceScreen*: force_screen_client_size returns
-         * logical coords anchored at the preferred work rect origin, but
-         * Win32 SetWindowPos below needs PHYSICAL pixels. Translate size and
-         * position by the target monitor's divisor (identity at 100%). */
+         * app-space logical coords anchored at the preferred work rect origin;
+         * placement needs the presentation space, where a secondary target is
+         * raw physical. Translate by the physical/logical ratio. */
         {
-            RECT pmwork; HMONITOR pm = NULL; float pmdiv = 1.0f;
-            if (preferred_monitor_work_rect( &pmwork, &pm, &pmdiv ) && pmdiv > 1.0001f)
+            RECT pmwork; HMONITOR pm = NULL;
+            if (preferred_monitor_presented_rect( &pmwork, &pm ))
             {
-                x = (INT)(x * pmdiv); y = (INT)(y * pmdiv);
-                cx = (INT)(cx * pmdiv); cy = (INT)(cy * pmdiv);
+                INT pw = pmwork.right - pmwork.left, ph = pmwork.bottom - pmwork.top;
+                RECT fixwr;
+                INT lw = pw, lh = ph;
+                if (get_fix_screen_work_rect( &fixwr ))
+                {
+                    lw = fixwr.right - fixwr.left;
+                    lh = fixwr.bottom - fixwr.top;
+                }
+                if (lw > 0 && lh > 0)
+                {
+                    x  = (INT)((float)x * pw / lw);
+                    y  = (INT)((float)y * ph / lh);   /* conservative: same anchor space */
+                    cx = (INT)((float)cx * pw / lw);
+                    cy = (INT)((float)cy * ph / lh);
+                }
             }
         }
         SetWindowPos( hwnd, NULL, x, y, cx, cy,
@@ -908,50 +921,38 @@ BOOL16 WINAPI ShowWindow16( HWND16 hwnd16, INT16 cmd )
     }
 
     /* [otvdm] PreferredMonitor: reproduce "make this my main display".
-     * The metric layer already reports the preferred monitor's LOGICAL work
-     * area to the 16-bit app (user.c). But Windows maximizes a top-level
-     * window onto whatever monitor it currently occupies using THAT monitor's
-     * own metrics; an untouched maximize therefore filled the primary at the
-     * wrong size and pushed child controls outside the visible client. Here we
-     * pre-place the frame at the preferred monitor's PHYSICAL work rect (the
-     * coordinate space this process' own Win32 calls use), then let Windows
-     * maximize: DWM recomputes the maximize rect from the monitor the window
-     * now sits on -- the preferred one -- with matching geometry, so the
-     * stretched bitmap covers exactly that panel and the app's logical layout
-     * lines up 1:1. Only top-level windows are touched; when the option is
-     * off or unresolvable this block does nothing. */
+     * The metric layer reports the preferred monitor's LOGICAL work area to
+     * the 16-bit app (user.c). For placement, Win32 inside this unaware
+     * process uses a MIXED presentation space: the primary monitor is
+     * virtualized (logical) while secondary monitors' rects are RAW PHYSICAL
+     * (proven by CoordSpace probes). The correct frame rect for maximizing
+     * onto the target panel is therefore the target's raw physical work rect
+     * -- no scaling. (The old prescaled-logical math made Windows maximize
+     * onto the PRIMARY instead; DWM then stretched the bitmap ~1.25x onto the
+     * target, which is exactly why the window looked right on the panel but
+     * the client area was too large and controls spilled outside.) Only
+     * top-level windows are touched; when the option is off or unresolvable
+     * this block does nothing. */
     if ((cmd == SW_SHOWMAXIMIZED || cmd == SW_MAXIMIZE) &&
         !GetParent( hwnd ) && !(GetWindowLongA( hwnd, GWL_STYLE ) & WS_CHILD))
     {
         RECT pmwork;
         HMONITOR pm = NULL;
-        if (preferred_monitor_work_rect( &pmwork, &pm, NULL ))
+        if (preferred_monitor_presented_rect( &pmwork, &pm ))
         {
-            /* pmwork is the app-space logical work rect of the target.
-             * PRESCALE by the primary stretch factor s: an unaware process'
-             * SetWindowPos coords are divided by s internally before DWM acts,
-             * so multiplying here lands the frame at exactly the target's
-             * PHYSICAL pixels -- maximizing then fills the preferred monitor
-             * 1:1 (no double division like raw-phys, no undersize like
-             * unscaled logical). */
-            INT px, py, pcx, pcy;
-            INT lw = pmwork.right - pmwork.left, lh = pmwork.bottom - pmwork.top;
-            float spm = fix_screen_scale_for_placement( pm );
+            INT px = pmwork.left, py = pmwork.top;
+            INT pcx = pmwork.right - pmwork.left, pcy = pmwork.bottom - pmwork.top;
             DWORD st = GetWindowStyle( hwnd );
             BOOL wasMin = IsIconic( hwnd );
-            px  = (INT)(pmwork.left * spm + 0.5f);
-            py  = (INT)(pmwork.top  * spm + 0.5f);
-            pcx = (INT)(lw * spm + 0.5f);
-            pcy = (INT)(lh * spm + 0.5f);
             ReleaseThunkLock(&count);
             if (wasMin) ShowWindow( hwnd, SW_RESTORE );
             SetWindowLongA( hwnd, GWL_STYLE, st & ~WS_MAXIMIZE );
             SetWindowPos( hwnd, NULL, px, py, pcx, pcy,
                           SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW );
             SetWindowLongA( hwnd, GWL_STYLE, st );   /* restore style bits */
-            config_report_note( "ShowWindow16(PM): logical(%dx%d) -> place(%d,%d %dx%d) mon %p before maximize",
-                                lw, lh, px, py, pcx, pcy, (void*)pm );
-            fix_screen_dump_coord_space( hwnd, pmwork.left, pmwork.top, lw, lh );
+            config_report_note( "ShowWindow16(PM): place(%d,%d %dx%d) mon %p before maximize",
+                                px, py, pcx, pcy, (void*)pm );
+            fix_screen_dump_coord_space( hwnd, px, py, pcx, pcy );
             RestoreThunkLock(count);
         }
     }
@@ -2447,26 +2448,36 @@ BOOL16 WINAPI SetWindowPos16( HWND16 hwnd, HWND16 hwndInsertAfter,
         fix_screen_clamp_maximized_rect( hwnd32, &ix, &iy, &cx32, &cy32 );
         /* PreferredMonitor: the app requested LOGICAL geometry sized from the
          * target monitor's reported work area, but Windows answers SetWindowPos
-         * in this process' own presented coordinate space -- so near-fullscreen
+         * in this process' own presentation space -- so near-fullscreen
          * top-level requests landed on the primary at the wrong scale (frame
          * too large, controls spilled outside the visible client). Place such
-         * frames directly at the preferred monitor's presented-space work rect
-         * (physical size, correct offsets) instead. */
+         * frames directly at the preferred monitor's RAW PHYSICAL work rect
+         * (correct offsets and size; secondary monitors are not virtualized
+         * for coord APIs in unaware processes -- proven by CoordSpace probes). */
         {
             RECT ap; HMONITOR pm = NULL;
-            /* app-space logical rect; prescale below for placement */
-            if (preferred_monitor_work_rect( &ap, &pm, NULL ) &&
-                cx32 >= (INT)(ap.right - ap.left) * 95 / 100 &&
-                cy32 >= (INT)(ap.bottom - ap.top) * 85 / 100)
+            RECT fixwr;
+            INT cxlog, cylog;   /* request as app-space logical size */
+            if (preferred_monitor_presented_rect( &ap, &pm ) &&
+                get_fix_screen_work_rect( &fixwr ))
             {
-                float spm = fix_screen_scale_for_placement( pm );
-                INT alw = ap.right - ap.left, alh = ap.bottom - ap.top;
-                ix   = (INT)(ap.left * spm + 0.5f);
-                iy   = (INT)(ap.top  * spm + 0.5f);
-                cx32 = (INT)(alw * spm + 0.5f);
-                cy32 = (INT)(alh * spm + 0.5f);
-                config_report_note( "SetWindowPos16(PM): req(%d,%d %dx%d) -> place(%d,%d %dx%d) mon %p",
-                                    x, y, cx, cy, ix, iy, cx32, cy32, (void*)pm );
+                INT alw = fixwr.right - fixwr.left, alh = fixwr.bottom - fixwr.top;  /* logical */
+                INT pw  = ap.right - ap.left,       ph = ap.bottom - ap.top;         /* physical */
+                cxlog = cx32; cylog = cy32;
+                /* normalize a possibly-physical-scaled request down to logical
+                 * before comparing against the logical work size */
+                if (cxlog >= pw * 95 / 100 && cylog >= ph * 85 / 100)
+                {
+                    /* already physical-sized; convert to logical for compare */
+                    cxlog = (INT)((float)cxlog * alw / pw);
+                    cylog = (INT)((float)cylog * alh / ph);
+                }
+                if (cxlog >= alw * 95 / 100 && cylog >= alh * 85 / 100)
+                {
+                    ix = ap.left; iy = ap.top; cx32 = pw; cy32 = ph;
+                    config_report_note( "SetWindowPos16(PM): req(%d,%d %dx%d) -> place(%d,%d %dx%d) mon %p",
+                                        x, y, cx, cy, ix, iy, cx32, cy32, (void*)pm );
+                }
             }
         }
         x = (INT16)ix; y = (INT16)iy; cx = (INT16)cx32; cy = (INT16)cy32;
@@ -2474,35 +2485,38 @@ BOOL16 WINAPI SetWindowPos16( HWND16 hwnd, HWND16 hwndInsertAfter,
     /* [otvdm] PreferredMonitor: a Win16 app never chooses a monitor -- it
      * sizes its main frame from SM_CXSCREEN/SPI_GETWORKAREA, which we already
      * report as the preferred monitor's LOGICAL work rect. But plain Win32
-     * SetWindowPos positions in PHYSICAL desktop pixels, so an untouched
+     * SetWindowPos inside this unaware process uses the mixed presentation
+     * space (primary virtualized, secondaries raw physical), so an untouched
      * request lands on the primary at the wrong scale (controls spill outside
      * the client). For top-level resize/move calls whose requested size fills
-     * (or nearly fills) the corrected logical work area, translate the rect to
-     * physical pixels and re-anchor it inside the preferred monitor's physical
-     * bounds. Child controls are left alone: they flow with the parent frame.
-     * No-op when PreferredMonitor is unset or scaling is 100%. */
+     * (or nearly fills) the corrected logical work area, snap the frame to the
+     * preferred monitor's RAW PHYSICAL work rect. Child controls are left
+     * alone: they flow with the parent frame. No-op when PreferredMonitor is
+     * unset. */
     if (!(flags & SWP_NOSIZE) && !fs_forced && hwnd32 == WIN_Handle32(hwnd) &&
         GetAncestor( hwnd32, GA_PARENT ) == GetDesktopWindow() &&
         !(GetWindowLongA( hwnd32, GWL_STYLE ) & WS_CHILD))
     {
         RECT ap; HMONITOR pm = NULL;
-        if (preferred_monitor_work_rect( &ap, &pm, NULL ))
+        RECT fixwr;
+        if (preferred_monitor_presented_rect( &ap, &pm ) &&
+            get_fix_screen_work_rect( &fixwr ))
         {
-            float spm = fix_screen_scale_for_placement( pm );
-            INT alw = ap.right - ap.left, alh = ap.bottom - ap.top;
-            INT pcx = (INT)(alw * spm + 0.5f), pcy = (INT)(alh * spm + 0.5f);
-            /* the 16-bit request is expressed in app-space logical pixels;
-             * compare sizes there, place in prescaled physical pixels */
+            INT alw = fixwr.right - fixwr.left, alh = fixwr.bottom - fixwr.top;  /* logical */
+            INT pw  = ap.right - ap.left,       ph = ap.bottom - ap.top;         /* physical */
+            INT cxlog = cx, cylog = cy;
+            /* normalize a possibly-physical-scaled request down to logical */
+            if (cxlog >= pw * 95 / 100 && cylog >= ph * 85 / 100)
             {
-                if (cx >= (INT)(alw * 0.95f) && cy >= (INT)(alh * 0.9f))
-                {
-                    INT px = (INT)(ap.left * spm + 0.5f);
-                    INT py = (INT)(ap.top  * spm + 0.5f);
-                    cx = (INT16)pcx; cy = (INT16)pcy;   /* snap to exact target size */
-                    config_report_note( "SetWindowPos16(PM): logical(%d,%d %dx%d) -> place(%d,%d %dx%d) on mon %p",
-                                        x, y, cx, cy, px, py, pcx, pcy, (void*)pm );
-                    x = (INT16)px; y = (INT16)py;
-                }
+                cxlog = (INT)((float)cxlog * alw / pw);
+                cylog = (INT)((float)cylog * alh / ph);
+            }
+            if (cxlog >= alw * 95 / 100 && cylog >= alh * 90 / 100)
+            {
+                INT px = ap.left, py = ap.top;
+                config_report_note( "SetWindowPos16(PM): logical(%d,%d %dx%d) -> place(%d,%d %dx%d) on mon %p",
+                                    x, y, cx, cy, px, py, pw, ph, (void*)pm );
+                x = (INT16)px; y = (INT16)py; cx = (INT16)pw; cy = (INT16)ph;
             }
         }
     }
