@@ -1818,7 +1818,7 @@ static BOOL get_fix_screen_work_rect( RECT *out )
  * Only considers windows whose requested size actually covers the screen;
  * ordinary windows, dialogs and child controls pass through untouched.
  * Returns TRUE when the rect was modified. */
-BOOL fix_screen_clamp_maximized_rect( HWND hwnd32, LPINT px, LPINT py, LPINT pcx, LPINT pcy )
+BOOL WINAPI fix_screen_clamp_maximized_rect( HWND hwnd32, LPINT px, LPINT py, LPINT pcx, LPINT pcy )
 {
     RECT work;
     INT w = *pcx, h = *pcy;
@@ -1888,8 +1888,16 @@ BOOL fix_screen_clamp_maximized_rect( HWND hwnd32, LPINT px, LPINT py, LPINT pcx
  * fixed-size window).  When only one of the two is set, the other keeps
  * the FixScreenSize/DPI-corrected value.  Unset/0 disables the feature
  * entirely and behavior is byte-for-byte the old code path.
+ *
+ * NOTE: WINAPI (__stdcall) is deliberate.  MSVC's default calling convention
+ * for this project is __cdecl, which emits the symbol as _force_screen_sizes;
+ * window.obj used to reference exactly that name while user.obj exported
+ * force_screen_sizes (no underscore), producing LNK2019 "unresolved external
+ * symbol _force_screen_sizes".  Declaring the definition WINAPI makes both
+ * TUs agree on the decorated name _force_screen_sizes@8 regardless of the
+ * project's default convention.  Do not remove.
  * ------------------------------------------------------------------------ */
-void force_screen_sizes( INT *pw, INT *ph )
+void WINAPI force_screen_sizes( INT *pw, INT *ph )
 {
     static INT init_w = -1, init_h = -1;
     if (init_w < 0)
@@ -1903,7 +1911,7 @@ void force_screen_sizes( INT *pw, INT *ph )
     *ph = init_h;
 }
 
-BOOL force_screen_size_enabled(void)
+BOOL WINAPI force_screen_size_enabled(void)
 {
     INT w, h;
     force_screen_sizes( &w, &h );
@@ -1923,7 +1931,7 @@ static float force_screen_scale(void)
  * the work area of the monitor the window lives on.  A component of pref_w/
  * pref_h <= 0 means "keep whatever the window currently has there".
  * Writes x/y/cx/cy suitable for SetWindowPos (physical pixels). */
-void force_screen_client_size( HWND hwnd32, const INT *pref_w, const INT *pref_h,
+void WINAPI force_screen_client_size( HWND hwnd32, const INT *pref_w, const INT *pref_h,
                                LPINT out_x, LPINT out_y, LPINT out_cx, LPINT out_cy )
 {
     INT fw = *pref_w, fh = *pref_h;
