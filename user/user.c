@@ -1889,7 +1889,7 @@ BOOL fix_screen_clamp_maximized_rect( HWND hwnd32, LPINT px, LPINT py, LPINT pcx
  * the FixScreenSize/DPI-corrected value.  Unset/0 disables the feature
  * entirely and behavior is byte-for-byte the old code path.
  * ------------------------------------------------------------------------ */
-static void force_screen_sizes( INT *pw, INT *ph )
+void force_screen_sizes( INT *pw, INT *ph )
 {
     static INT init_w = -1, init_h = -1;
     if (init_w < 0)
@@ -1923,7 +1923,7 @@ static float force_screen_scale(void)
  * the work area of the monitor the window lives on.  A component of pref_w/
  * pref_h <= 0 means "keep whatever the window currently has there".
  * Writes x/y/cx/cy suitable for SetWindowPos (physical pixels). */
-void force_screen_client_size( HWND hwnd32, LPCINT pref_w, LPCINT pref_h,
+void force_screen_client_size( HWND hwnd32, const INT *pref_w, const INT *pref_h,
                                LPINT out_x, LPINT out_y, LPINT out_cx, LPINT out_cy )
 {
     INT fw = *pref_w, fh = *pref_h;
