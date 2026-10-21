@@ -190,6 +190,7 @@ EXPORTS
 
   krnl386_get_config_string
   krnl386_get_config_int
+  config_report_note @754
   krnl386_get_compat_mode
   krnl386_set_compat_path
 

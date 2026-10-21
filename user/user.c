@@ -41,6 +41,42 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(user);
 
+/***********************************************************************
+ *              Config report geometry probe helper
+ *
+ * When [otvdm] ConfigReport=1 is active, the launcher and krnl386 write a
+ * single shared otvdm_config_report.log. user.exe16 has no import-time link
+ * against krnl386's config-report symbols, so we resolve 'config_report_note'
+ * from the already-loaded krnl386.exe16 with GetProcAddress on first use and
+ * log the monitor / work-area rects that the FixScreenSize code paths compute.
+ * That lets us see exactly which rect values (primary vs. secondary monitor,
+ * full vs. work area) the 16-bit apps are being handed, so the correction can
+ * be tuned from evidence instead of guesswork. No-ops when reporting is off.
+ */
+typedef void (WINAPI *config_report_note_t)( LPCSTR text );
+
+static void config_report_note( LPCSTR fmt, ... )
+{
+    static config_report_note_t pfn_note;
+    static BOOL tried;
+    CHAR buf[ 256 ];
+    va_list ap;
+
+    if (!tried)
+    {
+        tried = TRUE;
+        pfn_note = (config_report_note_t)GetProcAddress( GetModuleHandleA( "krnl386.exe16" ),
+                                                          "config_report_note" );
+    }
+    if (!pfn_note)
+        return;
+    va_start( ap, fmt );
+    vsnprintf( buf, sizeof(buf), fmt, ap );
+    va_end( ap );
+    buf[sizeof(buf) - 1] = 0;
+    pfn_note( buf );
+}
+
 /* handle to handle 16 conversions */
 #define HANDLE_16(h32)		HWND_16(h32) /* (LOWORD(h32)) */
 #define HGDIOBJ_16(h32)		HDC_16(h32) /* (LOWORD(h32)) */
@@ -1631,6 +1667,12 @@ INT16 WINAPI GetSystemMetrics16( INT16 index )
         }
         if (point.right > point.left && point.bottom > point.top)
         {
+            static BOOL logged_metrics;
+            config_report_note( "GetSystemMetrics(FixScreenSize): cursor(%d,%d) work rect L%d T%d R%d B%d (%dx%d)%s",
+                                pt.x, pt.y, (int)point.left, (int)point.top,
+                                (int)point.right, (int)point.bottom,
+                                (int)(point.right - point.left), (int)(point.bottom - point.top),
+                                logged_metrics ? "" : ((logged_metrics = TRUE), " [first probe of this rect only]") );
             if (index == SM_CXSCREEN)
             {
                 return point.right - point.left;
@@ -4008,6 +4050,9 @@ BOOL16 WINAPI SystemParametersInfo16( UINT16 uAction, UINT16 uParam,
                     r16->right  = tmp.right;
                     r16->bottom = tmp.bottom;
                 }
+                config_report_note( "SPI_GETWORKAREA(FixScreenSize): secondary monitor work rect L%d T%d R%d B%d (%dx%d)",
+                                    (int)tmp.left, (int)tmp.top, (int)tmp.right, (int)tmp.bottom,
+                                    (int)(tmp.right - tmp.left), (int)(tmp.bottom - tmp.top) );
                 break;
             }
         }
@@ -4020,6 +4065,10 @@ BOOL16 WINAPI SystemParametersInfo16( UINT16 uAction, UINT16 uParam,
             r16->right  = tmp.right;
             r16->bottom = tmp.bottom;
         }
+        if (krnl386_get_config_int("otvdm", "FixScreenSize", FALSE))
+            config_report_note( "SPI_GETWORKAREA(primary fallback): rect L%d T%d R%d B%d (%dx%d)",
+                                (int)tmp.left, (int)tmp.top, (int)tmp.right, (int)tmp.bottom,
+                                (int)(tmp.right - tmp.left), (int)(tmp.bottom - tmp.top) );
 	break;
     }
 

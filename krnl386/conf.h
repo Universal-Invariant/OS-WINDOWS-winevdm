@@ -13,4 +13,9 @@ void init_config(void);
 void config_report_enable_check(void);
 void config_report_lookup(LPCSTR section, LPCSTR key, const CHAR *value_or_default, BOOL found);
 
+/* free-form diagnostic line appended to the shared config report; used by
+ * user.exe16 to log the monitor/work-area rects that the FixScreenSize code
+ * paths compute (resolved with GetProcAddress at runtime) */
+void WINAPI config_report_note(LPCSTR text);
+
 #endif /* __WINE_KRNL386_CONF_H */

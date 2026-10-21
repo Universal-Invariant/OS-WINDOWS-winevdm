@@ -201,6 +201,19 @@ void config_report_lookup(LPCSTR section, LPCSTR key, const CHAR *value_or_defau
     config_report_write("otvdm: [%ld] %s\n", n, text);
 }
 
+/* print one diagnostic line to the shared report stream. This is the
+ * entry point used by user.exe16 (resolved with GetProcAddress on
+ * krnl386.exe16, see user/user.c config_report_note()) so that geometry
+ * probes — e.g. the monitor rects computed by the FixScreenSize code paths —
+ * land in the same single log without pulling config-report symbols into
+ * user.exe16's import table at link time. */
+void WINAPI config_report_note(LPCSTR text)
+{
+    if (!config_report_enabled || !text)
+        return;
+    config_report_write("otvdm: note: %s\n", text);
+}
+
 /* print the repeat counters collected by config_report_lookup; called once
  * from the launcher's final summary (config_report_finish) so every line in
  * the log appears exactly once */
