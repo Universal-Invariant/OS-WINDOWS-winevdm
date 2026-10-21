@@ -1,6 +1,7 @@
 #include <Windows.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 
 static BOOL init;
@@ -15,7 +16,10 @@ void init_config(void);
  * found and which values are read before launching a win16 app. */
 static BOOL config_report_enabled = FALSE;
 static FILE *config_report_stream = NULL;
+static volatile LONG *config_report_lock = NULL;
 static LONG config_report_count = 0;
+static BOOL config_report_header_written = FALSE;
+static BOOL config_report_summary_written = FALSE;
 
 /* the launcher (otvdm.exe) enables its copy of the report in
  * otvdm/config_report.c before krnl386 is even loaded; mirror that decision
@@ -42,11 +46,56 @@ static BOOL launcher_report_enabled(void)
 DWORD WINAPI krnl386_get_config_string(LPCSTR appname, LPCSTR keyname, LPCSTR def, LPSTR ret, DWORD size);
 DWORD WINAPI krnl386_get_config_int(LPCSTR appname, LPCSTR keyname, INT def);
 
+/* SINGLE SHARED LOG: the launcher and krnl386 are two PE images inside the
+ * same process and both used to fopen(otvdm_config_report.log, "a") with
+ * their own stdio buffers. Two independent append streams on one file
+ * interleave unpredictably and duplicated whole report sections (two
+ * headers, two 'about to launch' lines, lookups after the summary). Ask the
+ * launcher for its FILE* + spinlock and write through them instead; fall
+ * back to our own handle only when running under a host exe that does not
+ * export the accessor (e.g. wine preloader builds). */
+static BOOL launcher_shared_stream(FILE **out, volatile LONG **lock)
+{
+    typedef BOOL (*get_streams_t)(FILE **, volatile LONG **);
+    static get_streams_t pfn = NULL;
+    static int tried = 0;
+
+    if (!tried)
+    {
+        tried = 1;
+        pfn = (get_streams_t)GetProcAddress(GetModuleHandleA(NULL),
+                                            "get_config_report_streams");
+    }
+    if (!pfn) return FALSE;
+    return pfn(out, lock);
+}
+
+static void config_report_write(const char *fmt, ...)
+{
+    va_list ap;
+
+    if (!config_report_stream)
+        return;
+    if (config_report_lock)
+    {
+        while (InterlockedCompareExchange(config_report_lock, 1, 0)) Sleep(0);
+    }
+    va_start(ap, fmt);
+    vfprintf(config_report_stream, fmt, ap);
+    va_end(ap);
+    fflush(config_report_stream);
+    if (config_report_lock)
+        InterlockedExchange(config_report_lock, 0);
+}
+
 static void config_report_open(void)
 {
     CHAR path[MAX_PATH];
 
     if (config_report_stream)
+        return;
+    /* prefer the launcher's shared stream + lock (single serialized log) */
+    if (launcher_shared_stream(&config_report_stream, &config_report_lock))
         return;
     /* IMPORTANT: krnl386's 'filename' holds the path of otvdm.ini, not of
      * any exe, so appending a log name to it would write into a bogus
@@ -88,8 +137,7 @@ void config_report_enable_check(void)
     {
         config_report_enabled = TRUE;
         config_report_open();
-        fprintf(config_report_stream, "otvdm: ---- krnl386 config report enabled (mirrored from launcher) ----\n");
-        fflush(config_report_stream);
+        config_report_write("otvdm: ---- krnl386 section: config report enabled (mirrored from launcher) ----\n");
         return;
     }
     EnterCriticalSection(&critical_section);
@@ -99,8 +147,7 @@ void config_report_enable_check(void)
     {
         config_report_enabled = TRUE;
         config_report_open();
-        fprintf(config_report_stream, "otvdm: ---- config report enabled ([otvdm] ConfigReport=%s) ----\n", buf);
-        fflush(config_report_stream);
+        config_report_write("otvdm: ---- config report enabled ([otvdm] ConfigReport=%s) ----\n", buf);
         return;
     }
     /* OTVDM_CONFIG_REPORT env var works regardless of whether otvdm.ini was
@@ -110,34 +157,85 @@ void config_report_enable_check(void)
     {
         config_report_enabled = TRUE;
         config_report_open();
-        fprintf(config_report_stream, "otvdm: ---- config report enabled (env OTVDM_CONFIG_REPORT=%s) ----\n", env);
-        fflush(config_report_stream);
+        config_report_write("otvdm: ---- config report enabled (env OTVDM_CONFIG_REPORT=%s) ----\n", env);
     }
 }
 
 /* report one setting lookup: 'value_or_default' is the value actually found
- * in the ini, or the default that was used because the key was missing */
+ * in the ini, or the default that was used because the key was missing.
+ * Identical repeated lookups (AdjustDPI per font op, IAmNotNT per API call)
+ * are counted, not re-printed, so the log stays bounded and readable. */
+static struct { CHAR line[192]; LONG n; } config_report_seen[40];
+static int config_report_seen_count = 0;
+
 void config_report_lookup(LPCSTR section, LPCSTR key, const CHAR *value_or_default, BOOL found)
 {
+    CHAR text[192];
     LONG n;
+    int i;
 
     if (!config_report_enabled)
         return;
+    _snprintf(text, sizeof(text), "[%s] %s = %s (%s)",
+              section ? section : "?", key ? key : "?",
+              value_or_default ? value_or_default : "(null)",
+              found ? "found in ini" : "NOT FOUND - using default");
+    text[sizeof(text) - 1] = 0;
+
+    for (i = 0; i < config_report_seen_count; i++)
+    {
+        if (!strcmp(config_report_seen[i].line, text))
+        {
+            config_report_seen[i].n++;
+            return;
+        }
+    }
+    if (config_report_seen_count < (int)(sizeof(config_report_seen)/sizeof(config_report_seen[0])))
+    {
+        lstrcpynA(config_report_seen[config_report_seen_count].line, text,
+                  sizeof(config_report_seen[0].line));
+        config_report_seen[config_report_seen_count].n = 1;
+        config_report_seen_count++;
+    }
     n = InterlockedIncrement(&config_report_count);
-    fprintf(config_report_stream, "otvdm: [%ld] [%s] %s = %s (%s)\n",
-            n, section ? section : "?", key ? key : "?",
-            value_or_default ? value_or_default : "(null)",
-            found ? "found in ini" : "NOT FOUND - using default");
-    fflush(config_report_stream);
+    config_report_write("otvdm: [%ld] %s\n", n, text);
+}
+
+/* print the repeat counters collected by config_report_lookup; called once
+ * from the launcher's final summary (config_report_finish) so every line in
+ * the log appears exactly once */
+static void config_report_flush_repeats(void)
+{
+    int i;
+    for (i = 0; i < config_report_seen_count; i++)
+    {
+        if (config_report_seen[i].n > 1)
+            config_report_write("otvdm:      ^ '%s' was requested %ld times in total (repeats collapsed)\n",
+                                config_report_seen[i].line, config_report_seen[i].n);
+    }
+}
+
+void config_report_print_summary(void)
+{
+    if (!config_report_enabled)
+        return;
+    config_report_flush_repeats();
+    config_report_write("otvdm: ---- krnl386 section done: %ld distinct lookups ----\n",
+                        config_report_count);
 }
 
 static void config_report_summary(void)
 {
     if (!config_report_enabled)
         return;
-    fprintf(config_report_stream, "otvdm: ---- config report: %ld setting lookups logged ----\n",
-            config_report_count);
-    fflush(config_report_stream);
+    if (config_report_summary_written)
+        return;
+    config_report_summary_written = TRUE;
+    /* NOTE: intentionally NOT printing a final summary here. exec16() has
+     * just started the win16 task; user/gdi/driver DLLs perform many more
+     * lookups afterwards. The launcher writes the true end-of-report
+     * summary from winevdm.c after the app is up (config_report_finish),
+     * which calls config_report_print_summary() via GetProcAddress. */
 }
 
 void init_config(void)
@@ -182,17 +280,19 @@ void init_config(void)
     LeaveCriticalSection(&critical_section);
 
     /* emit the header now (before any other lookups) so even a completely
-     * missing ini file gets reported */
+     * missing ini file gets reported; exactly once per process */
     config_report_enable_check();
-    if (config_report_enabled)
+    if (config_report_enabled && !config_report_header_written)
     {
+        config_report_header_written = TRUE;
         config_report_open();
-        fprintf(config_report_stream, "otvdm: ==== otvdm.ini config report ====\n");
-        fprintf(config_report_stream, "otvdm: ini path: '%s'%s\n", filename,
-                (len && len < sizeof(inienv)) ? " (overridden by OTVDM_INI env var)" : "");
-        fprintf(config_report_stream, "otvdm: ini file %s\n",
-                ini_found ? "FOUND" : "NOT FOUND (all settings fall back to defaults)");
-        fflush(config_report_stream);
+        if (filename[0])
+            config_report_write("otvdm: ==== krnl386 section: ini path '%s'%s, ini file %s ====\n",
+                                filename,
+                                (len && len < sizeof(inienv)) ? " (overridden by OTVDM_INI env var)" : "",
+                                ini_found ? "FOUND" : "NOT FOUND (all settings fall back to defaults)");
+        else
+            config_report_write("otvdm: ==== krnl386 section: could not resolve otvdm.ini path ====\n");
     }
 }
 

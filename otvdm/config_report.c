@@ -26,7 +26,7 @@ static BOOL cfg_init_done = FALSE;
 static BOOL cfg_enabled = FALSE;
 static LONG cfg_count = 0;
 static FILE *cfg_stream = NULL;
-static BOOL reported_header = FALSE;
+static BOOL launcher_summary_written = FALSE;
 
 /* forward declarations: MSVC/C23-style compilers treat an implicit function
  * declaration as 'int f()', which then collides with the real definitions
@@ -35,6 +35,32 @@ static BOOL reported_header = FALSE;
 static void cfg_init( void );
 static int cfg_get_int(LPCSTR section, LPCSTR key, INT def, BOOL *found);
 void config_report_launch( LPCSTR appname );
+
+/* single shared log file: the launcher (this module) and krnl386.exe16 are
+ * separate PE images loaded into the SAME process and both append to
+ * otvdm_config_report.log next to the exe. krnl386 used to keep its own
+ * static FILE* and write a second handle to the same path; two independent
+ * append streams interleave unpredictably and duplicate whole sections of
+ * the report (observed in the field: two headers, two "about to launch"
+ * lines, lookups continuing after the summary). To serialize the two
+ * halves we publish our stream here so krnl386 writes through it. */
+FILE *config_report_shared_stream = NULL;
+volatile LONG config_report_shared_lock = 0;
+
+#define CFG_LOCK_ACQUIRE() while (InterlockedCompareExchange(&config_report_shared_lock, 1, 0)) Sleep(0)
+#define CFG_LOCK_RELEASE() InterlockedExchange(&config_report_shared_lock, 0)
+
+/* exported (see wine.def / otvdm.def): krnl386 resolves these with
+ * GetProcAddress on the main exe and routes its logging through the
+ * launcher's stream + lock. Returns TRUE when the report is enabled. */
+BOOL get_config_report_streams(FILE **out_stream, volatile LONG **out_lock)
+{
+    cfg_init();
+    if (!cfg_enabled || !cfg_stream) return FALSE;
+    *out_stream = cfg_stream;
+    *out_lock = &config_report_shared_lock;
+    return TRUE;
+}
 
 /* accessor used by krnl386/conf.c (resolved with GetProcAddress at runtime)
  * so the 16-bit side mirrors the launcher's report decision */
@@ -95,21 +121,64 @@ static void cfg_write( const char *fmt, ... )
         }
         if (!cfg_stream) cfg_stream = fopen( "otvdm_config_report.log", "a" );
         if (!cfg_stream) cfg_stream = stderr;
+        config_report_shared_stream = cfg_stream;   /* publish for krnl386 */
     }
+    CFG_LOCK_ACQUIRE();
     va_start( ap, fmt );
     vfprintf( cfg_stream, fmt, ap );
     va_end( ap );
     fflush( cfg_stream );
+    CFG_LOCK_RELEASE();
 }
+
+/* report one setting lookup. Every distinct lookup is printed exactly once,
+ * numbered; repeats of an identical line are collapsed into a 'seen xN'
+ * counter (AdjustDPI and IAmNotNT are read per GDI/window operation and can
+ * otherwise flood the log while the app runs). */
+static struct { CHAR line[192]; LONG n; } cfg_seen[32];
+static int cfg_seen_count = 0;
 
 static void cfg_lookup( LPCSTR section, LPCSTR key, const CHAR *value_or_default, BOOL found )
 {
+    CHAR text[192];
+    int i;
+
     if (!cfg_enabled) return;
-    cfg_write( "otvdm: [%ld] [%s] %s = %s (%s)\n",
-               InterlockedIncrement( &cfg_count ),
+
+    _snprintf( text, sizeof(text), "[%s] %s = %s (%s)",
                section ? section : "?", key ? key : "?",
                value_or_default ? value_or_default : "(null)",
                found ? "found in ini" : "NOT FOUND - using default" );
+    text[ sizeof(text) - 1 ] = 0;
+
+    for (i = 0; i < cfg_seen_count; i++)
+    {
+        if (!strcmp( cfg_seen[i].line, text ))
+        {
+            cfg_seen[i].n++;
+            return;
+        }
+    }
+    if (cfg_seen_count < (int)(sizeof(cfg_seen)/sizeof(cfg_seen[0])))
+    {
+        lstrcpynA( cfg_seen[cfg_seen_count].line, text, sizeof(cfg_seen[0].line) );
+        cfg_seen[cfg_seen_count].n = 1;
+        cfg_seen_count++;
+    }
+    cfg_write( "otvdm: [%ld] %s\n", InterlockedIncrement( &cfg_count ), text );
+}
+
+/* print the repeat counters for deduped lookups; called once from the final
+ * launcher summary so every line appears exactly once in the log */
+static void cfg_flush_dedupes( void )
+{
+    int i;
+    for (i = 0; i < cfg_seen_count; i++)
+    {
+        if (cfg_seen[i].n > 1)
+            cfg_write( "otvdm:      ^ '%s' was requested %ld times in total (repeats collapsed)\n",
+                       cfg_seen[i].line, cfg_seen[i].n );
+    }
 }
 
 static BOOL cfg_env_flag(void)
@@ -132,9 +201,8 @@ static void cfg_init( void )
         "DefaultInstallDir", "UseGlobalLocal", "SharedWow", "ConsoleBuffer",
     };
 
-    if (cfg_init_done || reported_header) return;
+    if (cfg_init_done) return;
     cfg_init_done = TRUE;
-    reported_header = TRUE;
 
     /* resolve the ini path the same way krnl386/conf.c does: next to the
      * exe, with an OTVDM_INI environment override for diagnostics */
@@ -174,10 +242,25 @@ static void cfg_init( void )
     cfg_get_int( "otvdm", "FixScreenSize", 0, &found );
     cfg_lookup( "otvdm", "FixScreenSize(int)", found ? "1" : "0", found );
     cfg_write( "otvdm: ---- launcher section done (%ld lookups so far) ----\n", cfg_count );
-    /* NOTE: krnl386.exe16 is a separate PE loaded in-process and keeps its
-     * own report state; on Windows it writes its per-setting lookups to its
-     * own copy of otvdm_config_report.log in the same directory. */
-    cfg_write( "otvdm: note: krnl386 logs its own lookups to a separate 'otvdm_config_report.log' copy in this same directory\n" );
+    /* krnl386.exe16 is a separate PE image loaded into this same process.
+     * It routes every lookup report through our shared stream + lock (see
+     * get_config_report_streams / krnl386/conf.c), so there is exactly ONE
+     * otvdm_config_report.log and no interleaved duplicate sections. */
+    cfg_write( "otvdm: note: krnl386 lookups follow below, sharing this log via the launcher's stream\n" );
+}
+
+/* final summary: written by winevdm.c AFTER exec16() returns (i.e. once the
+ * win16 app has been launched and all of its config lookups have been
+ * reported). This guarantees the summary is the last thing in the log and
+ * appears exactly once per process. */
+void config_report_finish( void )
+{
+    if (!cfg_enabled) return;
+    if (launcher_summary_written) return;
+    launcher_summary_written = TRUE;
+    cfg_flush_dedupes();
+    cfg_write( "otvdm: ---- config report finished: %ld distinct setting lookups logged (launcher + krnl386) ----\n",
+               cfg_count );
 }
 
 void config_report_launch( LPCSTR appname )
@@ -185,5 +268,4 @@ void config_report_launch( LPCSTR appname )
     cfg_init();                         /* one-time: parse ini/env, write header */
     if (!cfg_enabled || !appname) return;
     cfg_write( "otvdm: about to launch win16 app: '%s'\n", appname );
-    cfg_write( "otvdm: ---- config report: %ld launcher setting lookups logged ----\n", cfg_count );
 }
