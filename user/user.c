@@ -55,6 +55,141 @@ WINE_DEFAULT_DEBUG_CHANNEL(user);
  */
 typedef void (WINAPI *config_report_note_t)( LPCSTR text );
 
+/* ------------------------------------------------------------------------
+ * FixScreenSize DPI helpers
+ *
+ * otvdm.exe is DPI-unaware. On a display with scaling != 100% Windows only
+ * bitmap-virtualizes the *rendered output* of unaware processes (DWM stretches
+ * our window by the scale factor); it does NOT virtualize the monitor/work
+ * rects returned by GetSystemMetrics / SPI_GETWORKAREA / EnumDisplayMonitors /
+ * MonitorFromPoint for these APIs -- those keep coming back in raw physical
+ * pixels (e.g. 3440x1380 on a 3440x1440 panel at 125%). A Win16 app that lays
+ * itself out against those numbers ends up asking for the full physical
+ * monitor (including the taskbar strip), and after DWM's stretch its bottom
+ * rows overflow off-screen / behind the taskbar. That is exactly the
+ * "maximize covers the whole screen" symptom OSCAR shows.
+ *
+ * The fix: when we are truly DPI-unaware and the system applies bitmap
+ * stretching (scale > 1.0), convert the physical monitor/work rects to the
+ * logical space the stretched blit maps into, i.e. divide by the scale factor
+ * derived from the desktop DC (HORZRES/VERTRES = DPI-logical, DESKTOPVERTRES =
+ * physical). At 100% scaling or once the process is DPI-aware the ratio is
+ * 1.0 and every code path below degenerates to identity -- no behavior
+ * change. Values are cached per process because awareness cannot change after
+ * the first query and these metrics are read on every layout pass.
+ * ------------------------------------------------------------------------ */
+
+typedef HRESULT (WINAPI *get_process_dpi_awareness_t)( HANDLE, int * );
+typedef HRESULT (WINAPI *get_dpi_for_monitor_t)( HMONITOR, int, UINT *, UINT * );
+
+static float dpi_unaware_scale(void)   /* desktop DC physical/logical ratio */
+{
+    static FLOAT scale;        /* 0 = not probed yet */
+    if (!scale)
+    {
+        HDC dc = GetDC( NULL );
+        int logical = dc ? GetDeviceCaps( dc, VERTRES ) : 0;
+        int physical = dc ? GetDeviceCaps( dc, DESKTOPVERTRES ) : 0;
+        if (dc) ReleaseDC( NULL, dc );
+        scale = (float)((logical > 0 && physical > 0) ? ((double)physical / logical) : 1.0);
+    }
+    return scale;
+}
+
+static BOOL dpi_is_process_unaware(void)
+{
+    static int state;          /* 0 unknown, 1 unaware, 2 aware */
+    if (!state)
+    {
+        HMODULE shcore = LoadLibraryA( "shcore.dll" );   /* Win8.1+ */
+        /* keep shcore loaded: freeing it while holding the fn ptr is unsafe */
+        get_process_dpi_awareness_t pGetProcessDpiAwareness =
+            (get_process_dpi_awareness_t)(void *)(shcore ? GetProcAddress( shcore, "GetProcessDpiAwareness" ) : NULL);
+        if (pGetProcessDpiAwareness)
+        {
+            int awareness = -1;
+            if (SUCCEEDED( pGetProcessDpiAwareness( NULL, &awareness ) ))
+                state = (awareness == 0 /*PROCESS_DPI_UNAWARE*/) ? 1 : 2;
+            else
+                state = 1;      /* can't tell: assume unaware (safe default) */
+        }
+        else
+        {
+            /* No shcore (Win7/8). Do NOT probe with SetProcessDPIAware(): if the
+             * process were genuinely unaware that call would flip it to
+             * System-DPI-aware mid-flight and change the very behavior we are
+             * trying to measure. Pre-8.1 DWM bitmap-stretches unaware windows by
+             * the system scale just the same, and the desktop-DC ratio above
+             * already reflects it, so treat the process as unaware here too. */
+            state = 1;
+        }
+    }
+    return state == 1;
+}
+
+/* Scale factor to apply to physical rects before handing them to a 16-bit
+ * app: >1.0 only when the process is DPI-unaware AND Windows scales the
+ * desktop (bitmap virtualization active). Cached per process. */
+static float fix_screen_divisor(void)
+{
+    static FLOAT divisor;      /* 0 = not probed yet */
+    if (!divisor)
+    {
+        float s = dpi_unaware_scale();
+        divisor = (dpi_is_process_unaware() && s > 1.0f) ? s : 1.0f;
+    }
+    return divisor;
+}
+
+/* Divide a physical-pixel rect into the logical space a DPI-unaware process
+ * is bitmap-stretched into. Rounds sizes up/down so that ceil(w)*scale >= w
+ * (no content clipped) while keeping the total within sane bounds. */
+static void fix_screen_rect_unscale( RECT *rc, float div )
+{
+    INT w, h;
+    if (div <= 1.0f) return;
+    w = rc->right - rc->left;
+    h = rc->bottom - rc->top;
+    rc->right  = rc->left  + (INT)((w + 0.5f) / div);
+    rc->bottom = rc->top   + (INT)((h + 0.5f) / div);
+    if (rc->right  <= rc->left)  rc->right  = rc->left  + 1;
+    if (rc->bottom <= rc->top)   rc->bottom = rc->top   + 1;
+}
+
+/* Per-monitor refinement of the divisor: shcore's GetDpiForMonitor reports
+ * the *real* effective DPI of the monitor the VDM sits on even to unaware
+ * callers, which beats the system-wide desktop-DC ratio on multi-monitor
+ * setups where each display has its own scaling percentage. Falls back to
+ * the cached system divisor when unavailable. */
+static float fix_screen_monitor_divisor( HMONITOR hMon )
+{
+    static get_dpi_for_monitor_t pGetDpiForMonitor;
+    static int tried;
+    UINT dpiX = 0, dpiY = 0;
+    float sysdiv = fix_screen_divisor();
+
+    if (!hMon) return sysdiv;
+    if (!tried)
+    {
+        HMODULE shcore = LoadLibraryA( "shcore.dll" );
+        tried = 1;
+        /* keep shcore loaded: freeing it while holding the fn ptr is unsafe */
+        if (shcore)
+            pGetDpiForMonitor = (get_dpi_for_monitor_t)(void *)GetProcAddress( shcore, "GetDpiForMonitor" );
+    }
+    if (!pGetDpiForMonitor) return sysdiv;
+    if (FAILED( pGetDpiForMonitor( hMon, 0 /*MDT_EFFECTIVE_DPI*/, &dpiX, &dpiY ) ))
+        return sysdiv;
+    if (!dpiY) dpiY = dpiX;
+    if (!dpiY) return sysdiv;
+    {
+        float mdiv = (float)dpiY / 96.0f;
+        if (!dpi_is_process_unaware() || mdiv <= 1.0f)
+            return 1.0f;
+        return mdiv;
+    }
+}
+
 static void config_report_note( LPCSTR fmt, ... )
 {
     static config_report_note_t pfn_note;
@@ -1633,8 +1768,18 @@ HACCEL16 WINAPI LoadAccelerators16(HINSTANCE16 instance, LPCSTR lpTableName)
 
 /* Compute the FixScreenSize work rectangle: the work area of the monitor the
  * VDM window currently lives on (cursor position as proxy). Returns FALSE if
- * unavailable or degenerate. */
-static BOOL get_fix_screen_work_rect( RECT *out )
+ * unavailable or degenerate.
+ *
+ * DPI correction (approach A): in a DPI-unaware process under display scaling
+ * != 100%, the rect APIs above hand back raw *physical* pixels (Windows only
+ * bitmap-stretches the rendered output; it does not virtualize these queries).
+ * A Win16 app laid out against physical pixels overflows the screen after the
+ * stretch. So when we are unaware AND the desktop is scaled, divide the rect
+ * by the scale factor first: the app then lays out at the logical resolution
+ * (e.g. 2752x1104 at 125%), which DWM stretches back onto the real panel
+ * exactly. At 100% scaling or in an aware process the divisor is 1.0 and this
+ * degenerates to the old behavior. */
+static BOOL get_fix_screen_work_rect_ex( RECT *out, HMONITOR *phMon )
 {
     POINT pt = { 0, 0 };
     HMONITOR hMon;
@@ -1656,7 +1801,202 @@ static BOOL get_fix_screen_work_rect( RECT *out )
         out->right = GetSystemMetrics( SM_CXSCREEN );
         out->bottom = GetSystemMetrics( SM_CYSCREEN );
     }
+    fix_screen_rect_unscale( out, fix_screen_monitor_divisor( hMon ) );
+    if (phMon) *phMon = hMon;
     return (out->right > out->left && out->bottom > out->top);
+}
+
+static BOOL get_fix_screen_work_rect( RECT *out )
+{
+    return get_fix_screen_work_rect_ex( out, NULL );
+}
+
+/* Clamp a top-level window rect that fills (or overshoots) the whole screen
+ * down to the corrected work area. This catches the Delphi/VCL maximize path
+ * where the app passes the full *monitor bounds* (SM_CXSCREEN/CYSCREEN cached
+ * from an earlier query, or applied verbatim) instead of the work area.
+ * Only considers windows whose requested size actually covers the screen;
+ * ordinary windows, dialogs and child controls pass through untouched.
+ * Returns TRUE when the rect was modified. */
+BOOL fix_screen_clamp_maximized_rect( HWND hwnd32, LPINT px, LPINT py, LPINT pcx, LPINT pcy )
+{
+    RECT work;
+    INT w = *pcx, h = *pcy;
+
+    /* Never touch child windows / owned dialogs' contents: only top-level
+     * frames are candidates for the fullscreen clamp. */
+    if (hwnd32 && GetWindowLongA( hwnd32, GWL_STYLE ) & WS_CHILD)
+        return FALSE;
+    if (w <= 0 || h <= 0)
+        return FALSE;
+    /* only consider near-fullscreen sizes; small windows/dialogs must never
+     * be resized by this code path */
+    if (w < 600 || h < 400)
+        return FALSE;
+    if (!get_fix_screen_work_rect( &work ))
+        return FALSE;
+    {
+        INT wx = work.right - work.left;
+        INT wy = work.bottom - work.top;
+        BOOL clamped = FALSE;
+
+        /* shrink-only clamp of the requested size into the work area */
+        if (w > wx) { *pcx = wx; clamped = TRUE; }
+        if (h > wy) { *pcy = wy; clamped = TRUE; }
+        if (!clamped)
+            return FALSE;   /* already fits: leave position alone entirely */
+        /* keep the window inside the work area after the size clamp */
+        if (*px + *pcx > work.right) *px = work.right - *pcx;
+        if (*py + *pcy > work.bottom) *py = work.bottom - *pcy;
+        if (*px < work.left)  *px = work.left;
+        if (*py < work.top)   *py = work.top;
+        return TRUE;
+    }
+}
+
+/* ------------------------------------------------------------------------
+ * [otvdm] ForceScreenWidth / ForceScreenHeight  (direct size control)
+ *
+ * The user-facing knob for "I want the app to be exactly W x H, no matter
+ * what it or Windows thinks the screen size is."  Set in otvdm.ini:
+ *
+ *   [otvdm]
+ *   ForceScreenWidth=1280
+ *   ForceScreenHeight=720
+ *
+ * Semantics: these values describe the *client area* you want the main
+ * application window to have.  They take precedence over everything else:
+ *
+ *  - GetSystemMetrics16(SM_CX/CYSCREEN, FULLSCREEN, MAXIMIZED, MAXTRACK)
+ *    returns the forced numbers, so the Win16 app lays itself out against
+ *    them from the very start (Delphi VCL computes its maximized client
+ *    size from exactly these metrics).
+ *  - SystemParametersInfo16(SPI_GETWORKAREA) returns a work rect of the
+ *    forced size anchored at the current monitor's work-area origin.
+ *  - On every geometry change of a top-level 16-bit window (SetWindowPos16,
+ *    ShowWindow16(SW_SHOWMAXIMIZED), CreateWindowEx16 with WS_MAXIMIZE) the
+ *    window is re-forced to a *window* rect whose client area equals the
+ *    forced size -- even if the app asks for 3440x1440 or calls Maximize().
+ *    Frame/border thickness is measured live via GetWindowInfo, so MDI
+ *    parents, tool windows and normal captions all land on the right size.
+ *
+ * DPI note: the forced numbers are in the same coordinate space the 16-bit
+ * app sees.  Under Windows display scaling with the bitmap-virtualized
+ * (DPI-unaware) rendering path, the physical window ends up forced_size *
+ * scale pixels wide; pick values accordingly (e.g. on a 125% panel,
+ * 2752x1104 fills the whole work area, 1280x720 gives a comfortable
+ * fixed-size window).  When only one of the two is set, the other keeps
+ * the FixScreenSize/DPI-corrected value.  Unset/0 disables the feature
+ * entirely and behavior is byte-for-byte the old code path.
+ * ------------------------------------------------------------------------ */
+static void force_screen_sizes( INT *pw, INT *ph )
+{
+    static INT init_w = -1, init_h = -1;
+    if (init_w < 0)
+    {
+        init_w = krnl386_get_config_int( "otvdm", "ForceScreenWidth", 0 );
+        init_h = krnl386_get_config_int( "otvdm", "ForceScreenHeight", 0 );
+        if (init_w < 0) init_w = 0;
+        if (init_h < 0) init_h = 0;
+    }
+    *pw = init_w;
+    *ph = init_h;
+}
+
+BOOL force_screen_size_enabled(void)
+{
+    INT w, h;
+    force_screen_sizes( &w, &h );
+    return (w > 0 || h > 0);
+}
+
+/* If the process is DPI-unaware and Windows bitmap-stretches the desktop
+ * (scale != 1.0), convert logical <-> physical using the desktop-DC ratio.
+ * Reuses the FixScreenSize probes; at 100% scaling both are identity. */
+static float force_screen_scale(void)
+{
+    return fix_screen_divisor();
+}
+
+/* Compute the window rect (position + outer size) that makes hwnd's client
+ * area exactly (pref_w x pref_h) logical pixels, anchored at the top-left of
+ * the work area of the monitor the window lives on.  A component of pref_w/
+ * pref_h <= 0 means "keep whatever the window currently has there".
+ * Writes x/y/cx/cy suitable for SetWindowPos (physical pixels). */
+void force_screen_client_size( HWND hwnd32, LPCINT pref_w, LPCINT pref_h,
+                               LPINT out_x, LPINT out_y, LPINT out_cx, LPINT out_cy )
+{
+    INT fw = *pref_w, fh = *pref_h;
+    RECT wr, cr;
+    INT border_x = 0, border_y = 0;
+    float div = force_screen_scale();
+    POINT anchor = { 0, 0 };
+    HMONITOR hMon;
+    MONITORINFO mi = { sizeof(mi) };
+
+    /* Measure frame thickness from the window's own style via GetWindowInfo
+     * (user32!GetWindowInfo resolved dynamically: user.exe16 links against
+     * the import lib lazily and older SDK headers may not declare it). */
+    if (GetWindowRect( hwnd32, &wr ) && GetClientRect( hwnd32, &cr ))
+    {
+        border_x = (wr.right - wr.left) - (cr.right - cr.left);
+        border_y = (wr.bottom - wr.top) - (cr.bottom - cr.top);
+        if (border_x < 0) border_x = 0;
+        if (border_y < 0) border_y = 0;
+    }
+    {
+        typedef BOOL (WINAPI *get_window_info_t)( HWND, PWINDOWINFO );
+        static get_window_info_t pGetWindowInfo;
+        static BOOL tried_gwi;
+        WINDOWINFO wi = { sizeof(wi) };
+        if (!tried_gwi)
+        {
+            tried_gwi = TRUE;
+            pGetWindowInfo = (get_window_info_t)(void *)
+                GetProcAddress( GetModuleHandleA( "user32" ), "GetWindowInfo" );
+        }
+        /* Refine with GetWindowInfo when available: it reports exact
+         * non-client borders even for maximized/special frames. */
+        if (pGetWindowInfo && pGetWindowInfo( hwnd32, &wi ))
+        {
+            INT bx = (INT)wi.cxWindowBorders * 2;
+            INT by = (INT)wi.cyWindowBorders + GetSystemMetrics( SM_CYCAPTION )
+                     + GetSystemMetrics( SM_CXBORDER );
+            if (bx > 0 && bx <= wr.right - wr.left) border_x = bx;
+            if (by > 0 && by <= wr.bottom - wr.top) border_y = by;
+        }
+    }
+
+    if (fw <= 0) fw = (wr.right - wr.left) - border_x;   /* keep current width  */
+    if (fh <= 0) fh = (wr.bottom - wr.top) - border_y;   /* keep current height */
+    if (fw < 1) fw = 1;
+    if (fh < 1) fh = 1;
+
+    /* Anchor at the work-area origin of the monitor hosting the window, in
+     * the logical space the 16-bit world operates in. */
+    hMon = MonitorFromWindow( hwnd32, MONITOR_DEFAULTTONEAREST );
+    if (hMon && GetMonitorInfoA( hMon, &mi ))
+    {
+        RECT work = mi.rcWork;
+        fix_screen_rect_unscale( &work, fix_screen_monitor_divisor( hMon ) );
+        anchor.x = work.left;
+        anchor.y = work.top;
+    }
+    else if (get_fix_screen_work_rect( &wr ))
+    {
+        anchor.x = wr.left;
+        anchor.y = wr.top;
+    }
+    else
+    {
+        anchor.x = anchor.y = 0;
+    }
+
+    /* Back to physical pixels for the actual SetWindowPos call. */
+    *out_x = (INT)(anchor.x * div);
+    *out_y = (INT)(anchor.y * div);
+    *out_cx = (INT)(fw * div) + border_x;
+    *out_cy = (INT)(fh * div) + border_y;
 }
 
 INT16 WINAPI GetSystemMetrics16( INT16 index )
@@ -1667,6 +2007,25 @@ INT16 WINAPI GetSystemMetrics16( INT16 index )
     {
         init_fix_screen_size = TRUE;
         fix_screen_size = krnl386_get_config_int("otvdm", "FixScreenSize", FALSE);
+    }
+    /* [otvdm] ForceScreenWidth/Height override everything: the app lays
+     * itself out against exactly the size the user asked for. */
+    if ((index == SM_CXSCREEN || index == SM_CYSCREEN ||
+         index == SM_CXFULLSCREEN || index == SM_CYFULLSCREEN ||
+         index == SM_CXMAXIMIZED || index == SM_CYMAXIMIZED ||
+         index == SM_CXMAXTRACK || index == SM_CYMAXTRACK))
+    {
+        INT fw, fh;
+        force_screen_sizes( &fw, &fh );
+        if (index == SM_CXSCREEN || index == SM_CXFULLSCREEN ||
+            index == SM_CXMAXIMIZED || index == SM_CXMAXTRACK)
+        {
+            if (fw > 0) return (INT16)min(fw, 32767);
+        }
+        else
+        {
+            if (fh > 0) return (INT16)min(fh, 32767);
+        }
     }
     /* Fix the size of the screen to the value considering taskbar. */
     if (fix_screen_size &&
@@ -1679,7 +2038,11 @@ INT16 WINAPI GetSystemMetrics16( INT16 index )
         /* Multi-monitor: SPI_GETWORKAREA always reports the *primary* monitor's
          * work area. Use a context-aware monitor lookup instead so that the
          * virtual desktop metrics follow the monitor the emulator is actually
-         * running on (e.g. a portrait secondary display). */
+         * running on (e.g. a portrait secondary display). The rect comes back
+         * already unscaled to the DPI-logical space when this unaware process
+         * lives under display scaling != 100% (see get_fix_screen_work_rect_ex
+         * and fix_screen_* helpers above), which is what makes OSCAR lay out
+         * at ~2752x1104 instead of the physical 3440x1380/1440. */
         POINT pt = { 0, 0 };
         if (get_fix_screen_work_rect( &point ))
         {
@@ -1687,9 +2050,10 @@ INT16 WINAPI GetSystemMetrics16( INT16 index )
             INT cx = point.right - point.left;
             INT cy = point.bottom - point.top;
             GetCursorPos( &pt );
-            config_report_note( "GetSystemMetrics(FixScreenSize): cursor(%d,%d) work rect L%d T%d R%d B%d (%dx%d)%s",
+            config_report_note( "GetSystemMetrics(FixScreenSize): cursor(%d,%d) logical work rect L%d T%d R%d B%d (%dx%d) scale=%.3f%s",
                                 pt.x, pt.y, (int)point.left, (int)point.top,
                                 (int)point.right, (int)point.bottom, cx, cy,
+                                fix_screen_monitor_divisor( MonitorFromPoint( pt, MONITOR_DEFAULTTONEAREST ) ),
                                 logged_metrics ? "" : ((logged_metrics = TRUE), " [first probe of this rect only]") );
             switch (index)
             {
@@ -4041,6 +4405,35 @@ BOOL16 WINAPI SystemParametersInfo16( UINT16 uAction, UINT16 uParam,
     case SPI_GETWORKAREA:
     {
 	RECT tmp;
+        /* [otvdm] ForceScreenWidth/Height win over everything: report a
+         * work rect of exactly the forced size, anchored at the work-area
+         * origin of the monitor the emulator is running on. */
+        if (force_screen_size_enabled())
+        {
+            RECT base = { 0, 0, 0, 0 };
+            INT fw, fh;
+            force_screen_sizes( &fw, &fh );
+            get_fix_screen_work_rect( &base );   /* DPI-corrected anchor + fallback size */
+            if (fw <= 0) fw = base.right - base.left;
+            if (fh <= 0) fh = base.bottom - base.top;
+            tmp.left   = base.left;
+            tmp.top    = base.top;
+            tmp.right  = base.left + fw;
+            tmp.bottom = base.top + fh;
+            ret = TRUE;
+            if (lpvParam)
+            {
+                RECT16 *r16 = lpvParam;
+                r16->left   = tmp.left;
+                r16->top    = tmp.top;
+                r16->right  = tmp.right;
+                r16->bottom = tmp.bottom;
+            }
+            config_report_note( "SPI_GETWORKAREA(ForceScreenSize): rect L%d T%d R%d B%d (%dx%d)",
+                                (int)tmp.left, (int)tmp.top, (int)tmp.right, (int)tmp.bottom,
+                                (int)(tmp.right - tmp.left), (int)(tmp.bottom - tmp.top) );
+            break;
+        }
         /* Multi-monitor: SPI_GETWORKAREA reports only the primary monitor's
          * work area. When FixScreenSize is enabled, report the work area of
          * the monitor the emulator is actually running on instead, so that

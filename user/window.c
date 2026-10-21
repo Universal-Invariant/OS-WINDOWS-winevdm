@@ -864,9 +864,30 @@ HWND16 WINAPI CreateWindow16( LPCSTR className, LPCSTR windowName,
 /**************************************************************************
  *              ShowWindow   (USER.42)
  */
-BOOL16 WINAPI ShowWindow16( HWND16 hwnd, INT16 cmd )
+BOOL16 WINAPI ShowWindow16( HWND16 hwnd16, INT16 cmd )
 {
     DWORD count;
+    HWND hwnd = WIN_Handle32( hwnd16 );
+
+    /* [otvdm] ForceScreenWidth/Height: a Win16 app that maximizes itself
+     * (Delphi VCL does this on startup via WindowState:=wsMaximized ->
+     * ShowWindow(SW_SHOWMAXIMIZED)) would otherwise fill the entire screen
+     * no matter what. Re-issue the show as an explicit sized restore so the
+     * window ends up exactly at the forced client size instead. */
+    if (cmd == SW_SHOWMAXIMIZED && force_screen_size_enabled())
+    {
+        INT fw, fh, x, y, cx, cy;
+        force_screen_sizes( &fw, &fh );
+        ReleaseThunkLock(&count);
+        ShowWindow( hwnd, SW_RESTORE );
+        force_screen_client_size( hwnd, &fw, &fh, &x, &y, &cx, &cy );
+        SetWindowPos( hwnd, NULL, x, y, cx, cy,
+                      SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW );
+        config_report_note( "ShowWindow16(FS): maximize intercepted -> forced client %dx%d, win rect (%d,%d %dx%d)",
+                            fw, fh, x, y, cx, cy );
+        RestoreThunkLock(count);
+        return TRUE;
+    }
 
     ReleaseThunkLock(&count);
 #ifdef ATTACH_THREAD_INPUT
@@ -874,7 +895,7 @@ BOOL16 WINAPI ShowWindow16( HWND16 hwnd, INT16 cmd )
     //Attach
     AttachThreadInput(GetCurrentThreadId(), foregroundID, TRUE);
 #endif
-    BOOL ret = ShowWindow( WIN_Handle32(hwnd), cmd );
+    BOOL ret = ShowWindow( hwnd, cmd );
 #ifdef ATTACH_THREAD_INPUT
     //Dettach
     AttachThreadInput(GetCurrentThreadId(), foregroundID, FALSE);
@@ -2291,6 +2312,37 @@ BOOL16 WINAPI SetWindowPos16( HWND16 hwnd, HWND16 hwndInsertAfter,
     if (!cr_init) { cr_init = TRUE; cr_on = krnl386_get_config_int("otvdm", "ConfigReport", FALSE); }
     BOOL do_probe = cr_on && !(flags & SWP_NOSIZE) && hwnd32 == WIN_Handle32(hwnd);
 
+    /* [otvdm] ForceScreenWidth/Height: pin every *top-level* window resize
+     * to the forced client size. The 16-bit app's own maximize/fullscreen
+     * geometry requests (and Windows' own maximization math) are discarded
+     * and replaced by a rect whose client area is exactly the configured
+     * size. Child controls keep flowing through untouched so the VCL layout
+     * pass inside the window still works normally. */
+    BOOL fs_forced = FALSE;
+    INT fs_x = x, fs_y = y, fs_cx = cx, fs_cy = cy;
+    if (!(flags & SWP_NOSIZE) && hwnd32 == WIN_Handle32(hwnd) &&
+        force_screen_size_enabled() &&
+        GetAncestor( hwnd32, GA_PARENT ) == GetDesktopWindow())
+    {
+        INT fw, fh;
+        DWORD style = GetWindowLongA( hwnd32, GWL_STYLE );
+        /* MDI client children live inside the frame and must not be re-forced */
+        if (!(style & WS_CHILD))
+        {
+            RECT cur;
+            /* We force unconditionally -- that is the point of the option --
+             * but only for windows that are at least reasonably app-frame
+             * sized, so tiny helper/utility windows aren't blown up. */
+            if (cx >= 200 && cy >= 100 && GetWindowRect( hwnd32, &cur ))
+            {
+                force_screen_sizes( &fw, &fh );
+                force_screen_client_size( hwnd32, &fw, &fh, &fs_x, &fs_y, &fs_cx, &fs_cy );
+                x = fs_x; y = fs_y; cx = fs_cx; cy = fs_cy;
+                fs_forced = TRUE;
+            }
+        }
+    }
+
     if (GetExpWinVer16(GetExePtr(GetCurrentTask())) < 0x30a)
     {
         RECT rect;
@@ -2316,8 +2368,28 @@ BOOL16 WINAPI SetWindowPos16( HWND16 hwnd, HWND16 hwndInsertAfter,
     }
     DWORD count;
     ReleaseThunkLock(&count);
+    /* FixScreenSize (no ForceScreen* set): shrink-only clamp of fullscreen
+     * maximize rects into the DPI-corrected work area. x/y/cx/cy are the
+     * function parameters (plain INT16/WORD locals), so we can hand their
+     * addresses to the clamp helper directly. */
+    if (!force_screen_size_enabled() && !(flags & SWP_NOSIZE) &&
+        hwnd32 == WIN_Handle32(hwnd))
+    {
+        INT ix = x, iy = y;
+        INT cx32 = cx, cy32 = cy;
+        fix_screen_clamp_maximized_rect( hwnd32, &ix, &iy, &cx32, &cy32 );
+        x = (INT16)ix; y = (INT16)iy; cx = (INT16)cx32; cy = (INT16)cy32;
+    }
     BOOL16 result = SetWindowPos( hwnd32, full_insert_after_hwnd(hwndInsertAfter),
                          x, y, cx, cy, flags );
+    if (fs_forced && cr_on)
+    {
+        RECT fin;
+        GetWindowRect(hwnd32, &fin);
+        config_report_note( "SetWindowPos16(FS): forced win rect (%d,%d %dx%d) final L%d T%d R%d B%d",
+                            fs_x, fs_y, fs_cx, fs_cy,
+                            (int)fin.left, (int)fin.top, (int)fin.right, (int)fin.bottom );
+    }
     if (do_probe)
     {
         RECT after;
