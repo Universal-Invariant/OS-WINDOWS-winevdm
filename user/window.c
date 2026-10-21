@@ -27,6 +27,12 @@
 #include <stdarg.h>
 #include <stdio.h>
 
+/* SWP_NOMINMAXREC (0x0200) is not defined in this project's wine/windows/winuser.h;
+ * define it locally (guarded) so the ShowWindow16 preferred-monitor relocation compiles. */
+#ifndef SWP_NOMINMAXREC
+#define SWP_NOMINMAXREC 0x0200
+#endif
+
 WINE_DEFAULT_DEBUG_CHANNEL(win);
 
 /***********************************************************************
