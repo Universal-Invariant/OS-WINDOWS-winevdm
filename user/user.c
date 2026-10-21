@@ -82,6 +82,17 @@ typedef void (WINAPI *config_report_note_t)( LPCSTR text );
 typedef HRESULT (WINAPI *get_process_dpi_awareness_t)( HANDLE, int * );
 typedef HRESULT (WINAPI *get_dpi_for_monitor_t)( HMONITOR, int, UINT *, UINT * );
 
+/* BUGFIX: the old implementation of this probe called SetProcessDPIAware()
+ * when shcore.dll was unavailable.  That call is a one-way switch: it made
+ * THIS very process System-DPI-aware as a side effect of measuring it, after
+ * which Windows stops bitmap-virtualizing our output and every metric query
+ * returns raw physical pixels -- so the "scale" we computed from the desktop
+ * DC ratio always collapsed to 1.000 and FixScreenSize silently degenerated
+ * to identity on 125%-scaled panels (log line "scale=1.000").  The awareness
+ * state is now read passively via GetProcessDpiAwareness(NULL) only, with NO
+ * mutating API anywhere in this file. */
+static BOOL dpi_is_process_unaware(void);   /* forward decl: used below */
+
 static float dpi_unaware_scale(void)   /* desktop DC physical/logical ratio */
 {
     static FLOAT scale;        /* 0 = not probed yet */
@@ -4465,6 +4476,13 @@ BOOL16 WINAPI SystemParametersInfo16( UINT16 uAction, UINT16 uParam,
                 !(mi.dwFlags & MONITORINFOF_PRIMARY))
             {
                 tmp = mi.rcWork;
+                /* DPI correction: same physical->logical unscale that
+                 * get_fix_screen_work_rect applies.  With the launcher's
+                 * SetProcessDPIAware() side effect removed, an unaware
+                 * process under 125% scaling gets divisor 1.25 here and the
+                 * app lays out at logical pixels which DWM stretches back to
+                 * fill the panel exactly. */
+                fix_screen_rect_unscale( &tmp, fix_screen_monitor_divisor( hMon ) );
                 ret = TRUE;
                 if (lpvParam)
                 {
