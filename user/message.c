@@ -1655,6 +1655,39 @@ LRESULT WINPROC_CallProc16To32A( winproc_callback_t callback, HWND16 hwnd, UINT1
 
             MINMAXINFO16to32( mmi16, &mmi );
             ret = callback( hwnd32, msg, wParam, (LPARAM)&mmi, result, arg );
+            /* [otvdm] PreferredMonitor: the Win16 app's window manager
+             * (Delphi VCL etc.) reads WM_GETMINMAXINFO for maximize geometry
+             * and caches it for MDI-client/fullscreen sizing. The default
+             * MINMAXINFO comes from DefWindowProc and describes the REAL
+             * primary monitor -- exactly what keeps OSCAR laying out at the
+             * primary's size while we place the frame on the chosen panel.
+             * Rewrite every field to the chosen monitor's app-space geometry
+             * (bounds via preferred_monitor_screen_rect, work area via
+             * preferred_monitor_work_rect; both already origin-rebased to
+             * (0,0) and unscaled). ptMaxTrackSize gets the same treatment as
+             * Windows itself: bounds + full frame decoration. */
+            {
+                RECT pmscr, pmwork;
+                if (preferred_monitor_active( NULL ) &&
+                    preferred_monitor_screen_rect( &pmscr ) &&
+                    preferred_monitor_work_rect( &pmwork, NULL, NULL ))
+                {
+                    INT bx = pmscr.right, by = pmscr.bottom;          /* bounds size */
+                    INT wx = pmwork.right - pmwork.left;              /* work size   */
+                    INT wy = pmwork.bottom - pmwork.top;
+                    INT dx = bx - wx, dy = by - wy;                   /* taskbar pad */
+                    INT fx = 2 * GetSystemMetrics( SM_CXSIZEFRAME ) + 8;
+                    INT fy = 2 * GetSystemMetrics( SM_CYSIZEFRAME ) + GetSystemMetrics( SM_CYCAPTION ) + 8;
+                    mmi.ptMaxPosition.x = -dx;    /* Windows convention: maximized */
+                    mmi.ptMaxPosition.y = -dy;    /* frame sits at (-pad,-pad)      */
+                    mmi.ptMaxSize.x     = bx + fx;
+                    mmi.ptMaxSize.y     = by + fy;
+                    mmi.ptMinTrackSize.x = min( mmi.ptMinTrackSize.x, bx + fx );
+                    mmi.ptMinTrackSize.y = min( mmi.ptMinTrackSize.y, by + fy );
+                    mmi.ptMaxTrackSize.x = bx + fx;
+                    mmi.ptMaxTrackSize.y = by + fy;
+                }
+            }
             MINMAXINFO32to16( &mmi, mmi16 );
         }
         break;

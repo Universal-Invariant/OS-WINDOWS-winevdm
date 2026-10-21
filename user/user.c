@@ -281,6 +281,7 @@ static BOOL CALLBACK pref_mon_enum_cb( HMONITOR hMon, HDC hdc, LPRECT rc, LPARAM
 
 static HMONITOR  pref_mon_hmon;
 static RECT      pref_mon_work;    /* physical work rect of preferred monitor */
+static RECT      pref_mon_bounds;  /* physical bounds (full screen) of preferred monitor */
 static POINT     pref_mon_pri_origin;   /* physical origin of primary monitor */
 static BOOL      pref_mon_active;  /* resolved + usable */
 static BOOL      pref_mon_tried;
@@ -310,6 +311,7 @@ static BOOL pref_mon_resolve( void )
         return FALSE;
     }
     pref_mon_hmon   = ctx.hMon;
+    pref_mon_bounds = ctx.bounds;
     pref_mon_work   = ctx.work;
     pref_mon_pri_origin = ctx.pri_origin;
     pref_mon_active = TRUE;
@@ -403,7 +405,7 @@ static BOOL preferred_monitor_rect( RECT *out, HMONITOR *phMon, float *pfDiv )
         (mi_chk.dwFlags & MONITORINFOF_PRIMARY))
     {
         if (pfDiv) *pfDiv = 1.0f;
-        if (out) *out = pref_mon_work;
+        if (out) { *out = pref_mon_work; OffsetRect( out, -out->left, -out->top ); }
         if (phMon) *phMon = pref_mon_hmon;
         return TRUE;
     }
@@ -415,6 +417,8 @@ static BOOL preferred_monitor_rect( RECT *out, HMONITOR *phMon, float *pfDiv )
         v.top    = oy + (LONG)((pref_mon_work.top    - oy + 0.5f) / s);
         v.right  = ox + (LONG)((pref_mon_work.right  - ox + 0.5f) / s);
         v.bottom = oy + (LONG)((pref_mon_work.bottom - oy + 0.5f) / s);
+        /* present as a "primary": rebase so the chosen monitor starts at (0,0) */
+        OffsetRect( &v, -v.left, -v.top );
         *out = v;
     }
     if (phMon) *phMon = pref_mon_hmon;
@@ -449,6 +453,63 @@ BOOL preferred_monitor_work_rect( RECT *out, HMONITOR *phMon, float *pfDiv )
 BOOL preferred_monitor_presented_rect( RECT *out, HMONITOR *phMon )
 {
     return preferred_monitor_work_rect( out, phMon, NULL );
+}
+
+/* Screen-size rect (bounds, NOT work area) for the preferred monitor, in the
+ * same app-space coordinate system as preferred_monitor_work_rect: sizes are
+ * divided by the primary stretch factor s; origin rebased to (0,0) so the
+ * chosen monitor looks like a primary display. This is what SM_CXSCREEN /
+ * SM_CYSCREEN must report when [otvdm] PreferredMonitor is active -- exactly
+ * what Windows would return if that display were made the primary in Settings
+ * (the user-verified "known good" configuration). Uses the cached physical
+ * bounds from resolve time; no per-call shcore probing. */
+BOOL preferred_monitor_screen_rect( RECT *out )
+{
+    pref_mon_init();
+    if (!pref_mon_active || !out) return FALSE;
+    {
+        MONITORINFO mi = { sizeof(mi) };
+        float s = 1.0f;
+        if (!GetMonitorInfoA( pref_mon_hmon, &mi )) return FALSE;   /* staleness */
+        if (!(mi.dwFlags & MONITORINFOF_PRIMARY))
+        {
+            /* Stretch factor of the PRIMARY display (unaware bitmap scale).
+             * NOTE: fix_screen_monitor_divisor(chosen) would be WRONG here --
+             * it asks the chosen monitor's own DPI, but virtualization of an
+             * unaware process is driven by the primary's scale about the
+             * primary origin. Probe the primary via a point just inside its
+             * recorded origin; fall back to the desktop-DC ratio. */
+            POINT po; po.x = pref_mon_pri_origin.x + 1; po.y = pref_mon_pri_origin.y + 1;
+            HMONITOR hPri = MonitorFromPoint( po, MONITOR_DEFAULTTOPRIMARY );
+            if (hPri)
+            {
+                float ps = fix_screen_monitor_divisor( hPri );
+                if (ps > 1.0f) s = ps;
+            }
+            if (s <= 1.0f && dpi_is_process_unaware())
+            {
+                float ds = dpi_unaware_scale();
+                if (ds > 1.0f) s = ds;
+            }
+        }
+        out->left   = 0;
+        out->top    = 0;
+        out->right  = (LONG)((pref_mon_bounds.right  - pref_mon_bounds.left  + 0.5f) / s);
+        out->bottom = (LONG)((pref_mon_bounds.bottom - pref_mon_bounds.top   + 0.5f) / s);
+    }
+    return (out->right > 0 && out->bottom > 0);
+}
+
+/* PUBLIC (WINAPI/stdcall so the linker name is deterministic across TUs;
+ * declared in user_private.h): TRUE when [otvdm] PreferredMonitor is set and
+ * resolved to a real monitor. Kept for callers that only need an on/off test;
+ * the placement paths use preferred_monitor_presented_rect directly. */
+BOOL WINAPI preferred_monitor_active( HMONITOR *phMon )
+{
+    pref_mon_init();
+    if (!pref_mon_active) return FALSE;
+    if (phMon) *phMon = pref_mon_hmon;
+    return TRUE;
 }
 
 /* Placement scale factor for handing coordinates to Win32 SetWindowPos from
@@ -2389,6 +2450,29 @@ INT16 WINAPI GetSystemMetrics16( INT16 index )
         else
         {
             if (fh > 0) return (INT16)min(fh, 32767);
+        }
+    }
+    /* [otvdm] PreferredMonitor: SM_CXSCREEN/SM_CYSCREEN must report the
+     * CHOSEN monitor's full screen size (bounds, not work area), rebased to
+     * origin (0,0) and unscaled -- exactly what a primary display reports.
+     * Without this the app keeps laying child controls out against the real
+     * primary's width/height even though maximize/work-area now follow the
+     * preferred monitor (Delphi VCL reads SM_CXSCREEN for client sizing). */
+    if (fix_screen_size && preferred_monitor_active( NULL ) &&
+        (index == SM_CXSCREEN || index == SM_CYSCREEN))
+    {
+        RECT scr;
+        if (preferred_monitor_screen_rect( &scr ))
+        {
+            static BOOL logged_scr;
+            if (!logged_scr)
+            {
+                logged_scr = TRUE;
+                config_report_note( "GetSystemMetrics(PreferredMonitor): SM_C%sSCREEN -> %d (chosen-monitor screen size)",
+                                    (index == SM_CXSCREEN) ? "X" : "Y",
+                                    (int)(index == SM_CXSCREEN ? scr.right : scr.bottom) );
+            }
+            return (INT16)min( (index == SM_CXSCREEN ? scr.right : scr.bottom), 32767 );
         }
     }
     /* Fix the size of the screen to the value considering taskbar. */
@@ -4811,7 +4895,10 @@ BOOL16 WINAPI SystemParametersInfo16( UINT16 uAction, UINT16 uParam,
             RECT pmwork;
             HMONITOR pm = NULL;
             if (!preferred_monitor_work_rect( &pmwork, &pm, NULL )) break;   /* unreachable, defensive */
-            tmp = pmwork;   /* virtualized app-space work rect, ready to report */
+            /* preferred_monitor_work_rect already returns the chosen monitor's
+             * virtualized work rect rebased to origin (0,0) -- exactly what a
+             * primary display reports; no further offset needed here. */
+            tmp = pmwork;
             ret = TRUE;
             if (lpvParam)
             {

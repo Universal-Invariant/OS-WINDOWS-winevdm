@@ -912,8 +912,16 @@ BOOL16 WINAPI ShowWindow16( HWND16 hwnd16, INT16 cmd )
         HMONITOR pm = NULL;
         if (preferred_monitor_presented_rect( &pmwork, &pm ))
         {
-            INT px = pmwork.left, py = pmwork.top;
+            MONITORINFO pmi = { sizeof(pmi) };
+            INT px = 0, py = 0;                    /* app-space origin (0,0) */
             INT pcx = pmwork.right - pmwork.left, pcy = pmwork.bottom - pmwork.top;
+            /* the work rect is now presented rebased to (0,0); shift onto the
+             * chosen monitor's REAL desktop position for the Win32 placement */
+            if (pm && GetMonitorInfoA( pm, &pmi ) && !(pmi.dwFlags & MONITORINFOF_PRIMARY))
+            {
+                px = pmi.rcWork.left;
+                py = pmi.rcWork.top;
+            }
             DWORD st = GetWindowStyle( hwnd );
             BOOL wasMin = IsIconic( hwnd );
             ReleaseThunkLock(&count);
@@ -2429,9 +2437,22 @@ BOOL16 WINAPI SetWindowPos16( HWND16 hwnd, HWND16 hwndInsertAfter,
             if (preferred_monitor_presented_rect( &ap, &pm ))
             {
                 INT aw = ap.right - ap.left, ah = ap.bottom - ap.top;
-                if (cx32 >= aw * 95 / 100 && cy32 >= ah * 85 / 100)
+                /* ap is the origin-rebased app-space rect: the metric layer
+                 * reports the chosen monitor with work-area origin at (0,0),
+                 * so fullscreen requests come in near (0,0) too. Snap them to
+                 * the monitor's REAL desktop work origin via GetMonitorInfo
+                 * below so the frame lands on the panel. */
+                if ((cx32 >= aw * 95 / 100 && cy32 >= ah * 85 / 100) ||
+                    (ix <= 0 && iy <= 0 && cx32 >= aw * 95 / 100))
                 {
-                    ix = ap.left; iy = ap.top; cx32 = aw; cy32 = ah;
+                    MONITORINFO pmi = { sizeof(pmi) };
+                    ix = 0; iy = 0;
+                    if (pm && GetMonitorInfoA( pm, &pmi ) && !(pmi.dwFlags & MONITORINFOF_PRIMARY))
+                    {
+                        ix = pmi.rcWork.left;
+                        iy = pmi.rcWork.top;
+                    }
+                    cx32 = aw; cy32 = ah;
                     config_report_note( "SetWindowPos16(PM): req(%d,%d %dx%d) -> place(%d,%d %dx%d) mon %p",
                                         x, y, cx, cy, ix, iy, cx32, cy32, (void*)pm );
                 }
@@ -2461,7 +2482,13 @@ BOOL16 WINAPI SetWindowPos16( HWND16 hwnd, HWND16 hwndInsertAfter,
             INT aw = ap.right - ap.left, ah = ap.bottom - ap.top;
             if (cx >= aw * 95 / 100 && cy >= ah * 90 / 100)
             {
-                INT px = ap.left, py = ap.top;
+                MONITORINFO pmi = { sizeof(pmi) };
+                INT px = 0, py = 0;
+                if (pm && GetMonitorInfoA( pm, &pmi ) && !(pmi.dwFlags & MONITORINFOF_PRIMARY))
+                {
+                    px = pmi.rcWork.left;
+                    py = pmi.rcWork.top;
+                }
                 config_report_note( "SetWindowPos16(PM): req(%d,%d %dx%d) -> place(%d,%d %dx%d) on mon %p",
                                     x, y, cx, cy, px, py, aw, ah, (void*)pm );
                 x = (INT16)px; y = (INT16)py; cx = (INT16)aw; cy = (INT16)ah;
