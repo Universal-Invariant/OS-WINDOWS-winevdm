@@ -395,6 +395,18 @@ static BOOL preferred_monitor_rect( RECT *out, HMONITOR *phMon, float *pfDiv )
     }
     if (s < 1.0f) s = 1.0f;
 
+    /* If the chosen monitor IS the primary, no virtualization applies to
+     * its own rects inside this process -- report raw physical values and
+     * skip the stretch transform entirely (divisor 1.0). */
+    MONITORINFO mi_chk = { sizeof(mi_chk) };
+    if (GetMonitorInfoA( pref_mon_hmon, &mi_chk ) &&
+        (mi_chk.dwFlags & MONITORINFOF_PRIMARY))
+    {
+        if (pfDiv) *pfDiv = 1.0f;
+        if (out) *out = pref_mon_work;
+        if (phMon) *phMon = pref_mon_hmon;
+        return TRUE;
+    }
     if (out)
     {
         LONG ox = pref_mon_pri_origin.x, oy = pref_mon_pri_origin.y;
@@ -417,31 +429,26 @@ BOOL preferred_monitor_work_rect( RECT *out, HMONITOR *phMon, float *pfDiv )
     return preferred_monitor_rect( out, phMon, pfDiv );
 }
 
-/* Presentation accessor for window PLACEMENT (window.c): unlike the metric
- * layer above, Win32 SetWindowPos inside this unaware process operates in a
- * coordinate space where the PRIMARY monitor is virtualized (logical) but
- * secondary monitors' rects come back RAW PHYSICAL (proven by CoordSpace
- * probes: monbounds L-1080 T-231 R0 B1689 = 1080x1920 physical). Passing a
- * prescaled rect there made Windows maximize onto the primary and stretch
- * the bitmap 1.25x -- which is exactly why the app looked correct on the
- * target panel but its client was ~25% too large with controls spilling
- * outside. So placement must use the target's RAW PHYSICAL work rect with no
- * scaling applied. Returns FALSE when PreferredMonitor is unset/unresolved. */
+/* Presentation accessor for window PLACEMENT (window.c). v5 rewrite: the
+ * CoordSpace probe proved that EVERYTHING this unaware process sees and
+ * does through coord APIs lives in ONE linear presented space anchored at
+ * the primary origin: presented == phys/s (+ po*(1-1/s)), with s = primary
+ * DPI/96. That holds for SetWindowPos inputs AND GetWindowRect outputs even
+ * on secondary panels (the old "secondaries are raw physical" theory was
+ * wrong: passing the raw-physical rect placed the frame at logical offsets
+ * on the real panel -- the DWM-ext vs win32rect equality in the logs proves
+ * coords pass through untransformed). The previous raw-physical placement
+ * therefore made Windows report the frame back as 1080x1872 presented units
+ * = 1350x2340 REAL pixels on the portrait panel: oversized content clipped
+ * past the edges while the window itself sat on the right monitor --
+ * exactly the user-visible symptom. Placement must now use the SAME
+ * virtualized rect the metric layer reports to the 16-bit app, so what the
+ * app sizes against, what we place, and what WM_SIZE feeds back all share
+ * one consistent number. Returns FALSE when PreferredMonitor is
+ * unset/unresolved. */
 BOOL preferred_monitor_presented_rect( RECT *out, HMONITOR *phMon )
 {
-    pref_mon_init();
-    if (!pref_mon_active) return FALSE;
-    {
-        MONITORINFO mi = { sizeof(mi) };
-        if (!GetMonitorInfoA( pref_mon_hmon, &mi ))
-        {
-            pref_mon_active = FALSE;
-            if (!pref_mon_resolve()) return FALSE;
-        }
-        if (out) *out = mi.rcWork;   /* raw physical, presentation space */
-    }
-    if (phMon) *phMon = pref_mon_hmon;
-    return TRUE;
+    return preferred_monitor_work_rect( out, phMon, NULL );
 }
 
 /* Placement scale factor for handing coordinates to Win32 SetWindowPos from
