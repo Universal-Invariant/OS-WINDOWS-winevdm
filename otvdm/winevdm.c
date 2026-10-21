@@ -37,6 +37,8 @@
 WINE_DEFAULT_DEBUG_CHANNEL(winevdm);
 
 extern void __wine_load_dos_exe( LPCSTR filename, LPCSTR cmdline );
+void config_report_launch(LPCSTR appname);
+BOOL get_config_report_enabled(void);
 
 /***********************************************************************
  *           build_command_line
@@ -869,6 +871,12 @@ int entry_point( int argc, char *argv[] )
 
     params.hEnvironment = 0;
 
+    /* initialize the otvdm.ini config report up front (before any setting is
+     * consumed) so the log records the ini path and every lookup even when
+     * krnl386.exe16 is delay-loaded and fails to start */
+    if (get_config_report_enabled())
+        config_report_launch( NULL );
+
     use_shared_wow_server = !krnl386_get_config_int("otvdm", "SeparateWOWVDM", TRUE);
     if (use_shared_wow_server && run_shared_wow(appname, showCmd[1], cmdline))
     {
@@ -904,6 +912,7 @@ int entry_point( int argc, char *argv[] )
         BOOL res = ActivateActCtx(result, &lpCookie);
     }
 
+    config_report_launch( appname );
     exec16(params, appname, cmdline, TRUE);
     /* wait forever; the process will be killed when the last task exits */
     ReleaseThunkLock(&count);

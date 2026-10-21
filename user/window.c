@@ -24,8 +24,100 @@
 #include "wine/debug.h"
 #include "wine/exception.h"
 #include "../krnl386/kernel16_private.h"
+#include <stdarg.h>
+#include <stdio.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
+
+/***********************************************************************
+ *              Config report geometry probe helper (window.c)
+ *
+ * Mirrors the helper in user.c: user.exe16 has no import-time link
+ * against krnl386's config-report symbols, so resolve 'config_report_note'
+ * from the already-loaded krnl386.exe16 with GetProcAddress on first use.
+ * Used to log the rects that top-level 16-bit windows are actually given
+ * (requested vs. final window rect vs. monitor bounds), which is what we
+ * need to understand why a "maximized" OSCAR lands at 3440x1400 instead
+ * of the 2752x1104 work area reported by FixScreenSize. No-ops when
+ * reporting is off.
+ */
+typedef void (WINAPI *config_report_note_win_t)( LPCSTR text );
+
+static void config_report_note( LPCSTR fmt, ... )
+{
+    static config_report_note_win_t pfn_note;
+    static BOOL tried;
+    CHAR buf[ 256 ];
+    va_list ap;
+
+    if (!tried)
+    {
+        tried = TRUE;
+        pfn_note = (config_report_note_win_t)GetProcAddress( GetModuleHandleA( "krnl386.exe16" ),
+                                                              "config_report_note" );
+    }
+    if (!pfn_note)
+        return;
+    va_start( ap, fmt );
+    vsnprintf( buf, sizeof(buf), fmt, ap );
+    va_end( ap );
+    buf[sizeof(buf) - 1] = 0;
+    pfn_note( buf );
+}
+
+/* Monitor enumeration callback context */
+typedef struct
+{
+    UINT count;
+} monitor_enum_ctx;
+
+static BOOL CALLBACK config_report_monitor_enum_proc( HMONITOR hMon, HDC hdc,
+                                                      LPRECT rc, DWORD data )
+{
+    monitor_enum_ctx *ctx = (monitor_enum_ctx *)data;
+    MONITORINFO mi;
+    (void)hdc; (void)rc;
+    memset( &mi, 0, sizeof(mi) );
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoA( hMon, &mi ))
+    {
+        config_report_note( "monitor[%u]: bounds L%d T%d R%d B%d (%dx%d) work L%d T%d R%d B%d (%dx%d)%s",
+                            ctx->count,
+                            (int)mi.rcMonitor.left, (int)mi.rcMonitor.top,
+                            (int)mi.rcMonitor.right, (int)mi.rcMonitor.bottom,
+                            (int)(mi.rcMonitor.right - mi.rcMonitor.left),
+                            (int)(mi.rcMonitor.bottom - mi.rcMonitor.top),
+                            (int)mi.rcWork.left, (int)mi.rcWork.top,
+                            (int)mi.rcWork.right, (int)mi.rcWork.bottom,
+                            (int)(mi.rcWork.right - mi.rcWork.left),
+                            (int)(mi.rcWork.bottom - mi.rcWork.top),
+                            (mi.dwFlags & MONITORINFOF_PRIMARY) ? " [PRIMARY]" : "" );
+    }
+    ctx->count++;
+    return TRUE;
+}
+
+/* Log every monitor's bounds + work area once per process so we can see
+ * exactly which physical rect covers 3440x1400 and how it relates to the
+ * 2752x1104 work area returned by the FixScreenSize probes. */
+static void config_report_monitor_snapshot(void)
+{
+    static BOOL done;
+    monitor_enum_ctx ctx;
+
+    if (done) return;
+    if (!krnl386_get_config_int("otvdm", "ConfigReport", FALSE)) return;
+    done = TRUE;
+
+    config_report_note( "desktop virtual screen: origin(%d,%d) size %dx%d",
+                        GetSystemMetrics( SM_XVIRTUALSCREEN ),
+                        GetSystemMetrics( SM_YVIRTUALSCREEN ),
+                        GetSystemMetrics( SM_CXVIRTUALSCREEN ),
+                        GetSystemMetrics( SM_CYVIRTUALSCREEN ) );
+    memset( &ctx, 0, sizeof(ctx) );
+    EnumDisplayMonitors( NULL, NULL, config_report_monitor_enum_proc, (LPARAM)&ctx );
+    config_report_note( "monitor snapshot: %u monitor(s) enumerated", ctx.count );
+}
 
 struct {
     int next;
@@ -1144,6 +1236,40 @@ LRESULT WINAPI DesktopDCEmulationWindowProc(HWND hwnd, UINT msg, WPARAM wparam, 
 }
 static HWND dcemu_hwnd;
 static COLORREF DWMDesktopDCFixBackgroundColor = RGB(254, 254, 254);
+
+/* Multi-monitor fix: SPI_GETWORKAREA always returns the *primary* monitor's
+ * work area, which traps the emulated desktop canvas inside the primary
+ * screen footprint even when the app runs on a secondary display.
+ * Resolve the work area of the monitor the emulator is actually living on
+ * (MonitorFromWindow on our own process window / foreground window, falling
+ * back to MonitorFromPoint on the cursor), and only fall back to
+ * SPI_GETWORKAREA when that lookup fails. */
+static BOOL get_active_workarea(RECT *rc)
+{
+    HMONITOR hMon = NULL;
+    MONITORINFO mi = { sizeof(mi) };
+    HWND hwnd = GetForegroundWindow();
+    POINT pt;
+
+    if (!hwnd) hwnd = GetActiveWindow();
+    if (hwnd && IsWindow(hwnd))
+        hMon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!hMon && GetCursorPos(&pt))
+        hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    if (hMon && GetMonitorInfoW(hMon, &mi))
+    {
+        *rc = mi.rcWork;
+        return TRUE;
+    }
+    if (SystemParametersInfoW(SPI_GETWORKAREA, 0, rc, 0) &&
+        rc->right > rc->left && rc->bottom > rc->top)
+        return TRUE;
+    rc->left = rc->top = 0;
+    rc->right = GetSystemMetrics(SM_CXSCREEN);
+    rc->bottom = GetSystemMetrics(SM_CYSCREEN);
+    return FALSE;
+}
+
 void init_dcemu()
 {
     WNDCLASSW wc = { 0 };
@@ -1158,7 +1284,7 @@ void init_dcemu()
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
     wc.lpszClassName = L"DesktopDCEmulation";
     RegisterClassW(&wc);
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wkara, 0);
+    get_active_workarea(&wkara);
     hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST, L"DesktopDCEmulation", L"", 0, wkara.left, wkara.top, wkara.right - wkara.left, wkara.bottom - wkara.top, NULL, NULL, NULL, NULL);
     if (!hwnd)
         return;
@@ -2153,6 +2279,18 @@ BOOL16 WINAPI SetWindowPos16( HWND16 hwnd, HWND16 hwndInsertAfter,
     {
         hwnd32 = HWND_NOTOPMOST;
     }
+
+    /* FixScreenSize diagnostics: when ConfigReport is on, log every resize
+     * request and the resulting physical window rect, so we can see exactly
+     * which logical values the 16-bit app sends (e.g. a maximize rect of
+     * 2752x1104) and what the OS produces after DPI scaling (e.g. 3440x1400
+     * at 125% scaling). One-time ini lookup; when reporting is disabled the
+     * behavior of this function is completely unchanged. */
+    static BOOL cr_init;
+    static BOOL cr_on;
+    if (!cr_init) { cr_init = TRUE; cr_on = krnl386_get_config_int("otvdm", "ConfigReport", FALSE); }
+    BOOL do_probe = cr_on && !(flags & SWP_NOSIZE) && hwnd32 == WIN_Handle32(hwnd);
+
     if (GetExpWinVer16(GetExePtr(GetCurrentTask())) < 0x30a)
     {
         RECT rect;
@@ -2180,6 +2318,18 @@ BOOL16 WINAPI SetWindowPos16( HWND16 hwnd, HWND16 hwndInsertAfter,
     ReleaseThunkLock(&count);
     BOOL16 result = SetWindowPos( hwnd32, full_insert_after_hwnd(hwndInsertAfter),
                          x, y, cx, cy, flags );
+    if (do_probe)
+    {
+        RECT after;
+        char classbuf[64];
+        GetWindowRect(hwnd32, &after);
+        classbuf[0] = 0;
+        GetClassNameA(hwnd32, classbuf, sizeof(classbuf));
+        config_report_note( "SetWindowPos16 '%s': req(%d,%d %dx%d) flags=0x%04X final L%d T%d R%d B%d (%dx%d)",
+                            classbuf, x, y, cx, cy, flags,
+                            (int)after.left, (int)after.top, (int)after.right, (int)after.bottom,
+                            (int)(after.right - after.left), (int)(after.bottom - after.top) );
+    }
     RestoreThunkLock(count);
     return result;
 }
@@ -2539,6 +2689,27 @@ BOOL16 WINAPI GetWindowPlacement16( HWND16 hwnd, WINDOWPLACEMENT16 *wp16 )
     wp16->rcNormalPosition.top    = wpl.rcNormalPosition.top;
     wp16->rcNormalPosition.right  = wpl.rcNormalPosition.right;
     wp16->rcNormalPosition.bottom = wpl.rcNormalPosition.bottom;
+    /* Config-report geometry probe: the maximized/restored placement that a
+     * top-level 16-bit window is handed. WM_WINDOWPOSCHANGING and OSCAR's own
+     * layout code often use rcNormalPosition/ptMaxPosition rather than
+     * SM_CXSCREEN, so this tells us whether the 3440x1400 rect originates
+     * here. Deduplicated inside config_report_note. */
+    if (!GetWindow( WIN_Handle32(hwnd), GW_OWNER ) &&
+        GetParent( WIN_Handle32(hwnd) ) == NULL)
+    {
+        RECT wr;
+        GetWindowRect( WIN_Handle32(hwnd), &wr );
+        config_report_note( "GetWindowPlacement16: showCmd=%d ptMax(%d,%d) SM_CX/CYMAXIMIZED %dx%d normal L%d T%d R%d B%d (%dx%d) current (%dx%d)",
+                            (int)wpl.showCmd,
+                            (int)wpl.ptMaxPosition.x, (int)wpl.ptMaxPosition.y,
+                            GetSystemMetrics(SM_CXMAXIMIZED),
+                            GetSystemMetrics(SM_CYMAXIMIZED),
+                            (int)wpl.rcNormalPosition.left, (int)wpl.rcNormalPosition.top,
+                            (int)wpl.rcNormalPosition.right, (int)wpl.rcNormalPosition.bottom,
+                            (int)(wpl.rcNormalPosition.right - wpl.rcNormalPosition.left),
+                            (int)(wpl.rcNormalPosition.bottom - wpl.rcNormalPosition.top),
+                            (int)(wr.right - wr.left), (int)(wr.bottom - wr.top) );
+    }
     return TRUE;
 }
 
@@ -3266,10 +3437,54 @@ HWND16 WINAPI CreateWindowEx16( DWORD exStyle, LPCSTR className,
     }
 
     HWND16 hWnd16 = HWND_16(hwnd);
+    BOOL report_geom = FALSE;
 	InitWndProc16(hwnd, hWnd16);
     SetWindowHInst16(hWnd16, instance);
     if (!GetWindowHMenu16(hWnd16))
         SetWindowHMenu16(hWnd16, menu);
+
+    /* Config-report geometry probe must run OUTSIDE the thunk lock: it
+     * calls GetWindowRect/MonitorFromWindow/EnumDisplayMonitors and writes
+     * to the shared log; doing that while the WOW lock is held can
+     * deadlock or corrupt 16-bit state. Here we only decide + snapshot the
+     * requested coords (plain locals). */
+    if (!(style & WS_CHILD) && krnl386_get_config_int("otvdm", "ConfigReport", FALSE))
+        report_geom = TRUE;
+
+    /* Config-report geometry probe: log requested vs. actual rect for every
+     * top-level window so we can see what a "maximized" 16-bit app is really
+     * handed (e.g. OSCAR landing at 3440x1400 instead of the 2752x1104 work
+     * area reported by FixScreenSize). */
+    if (report_geom)
+    {
+        RECT final;
+        HMONITOR hMon;
+        MONITORINFO mi = { sizeof(mi) };
+        config_report_monitor_snapshot();
+        if (GetWindowRect( hwnd, &final ))
+        {
+            hMon = MonitorFromWindow( hwnd, MONITOR_DEFAULTTONEAREST );
+            config_report_note( "CreateWindowEx16 '%s': req(%d,%d %dx%d) final L%d T%d R%d B%d (%dx%d)%s",
+                                IS_INTRESOURCE(className) ? "(ATOM)" : className,
+                                (int)x, (int)y, (int)width, (int)height,
+                                (int)final.left, (int)final.top,
+                                (int)final.right, (int)final.bottom,
+                                (int)(final.right - final.left),
+                                (int)(final.bottom - final.top),
+                                (style & WS_MAXIMIZE) ? " [WS_MAXIMIZE]" : "" );
+            if (hMon && GetMonitorInfoA( hMon, &mi ))
+                config_report_note( "CreateWindowEx16 monitor under window: bounds L%d T%d R%d B%d (%dx%d) work L%d T%d R%d B%d (%dx%d)%s",
+                                    (int)mi.rcMonitor.left, (int)mi.rcMonitor.top,
+                                    (int)mi.rcMonitor.right, (int)mi.rcMonitor.bottom,
+                                    (int)(mi.rcMonitor.right - mi.rcMonitor.left),
+                                    (int)(mi.rcMonitor.bottom - mi.rcMonitor.top),
+                                    (int)mi.rcWork.left, (int)mi.rcWork.top,
+                                    (int)mi.rcWork.right, (int)mi.rcWork.bottom,
+                                    (int)(mi.rcWork.right - mi.rcWork.left),
+                                    (int)(mi.rcWork.bottom - mi.rcWork.top),
+                                    (mi.dwFlags & MONITORINFOF_PRIMARY) ? " [PRIMARY]" : "" );
+        }
+    }
     return hWnd16;
 }
 void InitWndProc16(HWND hWnd, HWND16 hWnd16)

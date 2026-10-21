@@ -41,6 +41,42 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(user);
 
+/***********************************************************************
+ *              Config report geometry probe helper
+ *
+ * When [otvdm] ConfigReport=1 is active, the launcher and krnl386 write a
+ * single shared otvdm_config_report.log. user.exe16 has no import-time link
+ * against krnl386's config-report symbols, so we resolve 'config_report_note'
+ * from the already-loaded krnl386.exe16 with GetProcAddress on first use and
+ * log the monitor / work-area rects that the FixScreenSize code paths compute.
+ * That lets us see exactly which rect values (primary vs. secondary monitor,
+ * full vs. work area) the 16-bit apps are being handed, so the correction can
+ * be tuned from evidence instead of guesswork. No-ops when reporting is off.
+ */
+typedef void (WINAPI *config_report_note_t)( LPCSTR text );
+
+static void config_report_note( LPCSTR fmt, ... )
+{
+    static config_report_note_t pfn_note;
+    static BOOL tried;
+    CHAR buf[ 256 ];
+    va_list ap;
+
+    if (!tried)
+    {
+        tried = TRUE;
+        pfn_note = (config_report_note_t)GetProcAddress( GetModuleHandleA( "krnl386.exe16" ),
+                                                          "config_report_note" );
+    }
+    if (!pfn_note)
+        return;
+    va_start( ap, fmt );
+    vsnprintf( buf, sizeof(buf), fmt, ap );
+    va_end( ap );
+    buf[sizeof(buf) - 1] = 0;
+    pfn_note( buf );
+}
+
 /* handle to handle 16 conversions */
 #define HANDLE_16(h32)		HWND_16(h32) /* (LOWORD(h32)) */
 #define HGDIOBJ_16(h32)		HDC_16(h32) /* (LOWORD(h32)) */
@@ -1594,6 +1630,35 @@ HACCEL16 WINAPI LoadAccelerators16(HINSTANCE16 instance, LPCSTR lpTableName)
 /***********************************************************************
  *		GetSystemMetrics (USER.179)
  */
+
+/* Compute the FixScreenSize work rectangle: the work area of the monitor the
+ * VDM window currently lives on (cursor position as proxy). Returns FALSE if
+ * unavailable or degenerate. */
+static BOOL get_fix_screen_work_rect( RECT *out )
+{
+    POINT pt = { 0, 0 };
+    HMONITOR hMon;
+    /* Note: this SDK's winuser.h declares only "MONITORINFO" (no
+     * MONITORINFOA alias), so stick to the portable struct name. */
+    MONITORINFO mi = { sizeof(mi) };
+
+    ZeroMemory( out, sizeof(*out) );
+    GetCursorPos( &pt );
+    hMon = MonitorFromPoint( pt, MONITOR_DEFAULTTONEAREST );
+    if (hMon && GetMonitorInfoA( hMon, &mi ) &&
+        !(mi.dwFlags & MONITORINFOF_PRIMARY))
+    {
+        *out = mi.rcWork;
+    }
+    else if (!SystemParametersInfoA( SPI_GETWORKAREA, 0, out, FALSE ))
+    {
+        out->left = out->top = out->right = out->bottom = 0;
+        out->right = GetSystemMetrics( SM_CXSCREEN );
+        out->bottom = GetSystemMetrics( SM_CYSCREEN );
+    }
+    return (out->right > out->left && out->bottom > out->top);
+}
+
 INT16 WINAPI GetSystemMetrics16( INT16 index )
 {
     static BOOL init_fix_screen_size;
@@ -1604,18 +1669,40 @@ INT16 WINAPI GetSystemMetrics16( INT16 index )
         fix_screen_size = krnl386_get_config_int("otvdm", "FixScreenSize", FALSE);
     }
     /* Fix the size of the screen to the value considering taskbar. */
-    if (fix_screen_size && (index == SM_CXSCREEN || index == SM_CYSCREEN))
+    if (fix_screen_size &&
+        (index == SM_CXSCREEN || index == SM_CYSCREEN ||
+         index == SM_CXFULLSCREEN || index == SM_CYFULLSCREEN ||
+         index == SM_CXMAXIMIZED || index == SM_CYMAXIMIZED ||
+         index == SM_CXMAXTRACK || index == SM_CYMAXTRACK))
     {
         RECT point;
-        if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &point, FALSE))
+        /* Multi-monitor: SPI_GETWORKAREA always reports the *primary* monitor's
+         * work area. Use a context-aware monitor lookup instead so that the
+         * virtual desktop metrics follow the monitor the emulator is actually
+         * running on (e.g. a portrait secondary display). */
+        POINT pt = { 0, 0 };
+        if (get_fix_screen_work_rect( &point ))
         {
-            if (index == SM_CXSCREEN)
+            static BOOL logged_metrics;
+            INT cx = point.right - point.left;
+            INT cy = point.bottom - point.top;
+            GetCursorPos( &pt );
+            config_report_note( "GetSystemMetrics(FixScreenSize): cursor(%d,%d) work rect L%d T%d R%d B%d (%dx%d)%s",
+                                pt.x, pt.y, (int)point.left, (int)point.top,
+                                (int)point.right, (int)point.bottom, cx, cy,
+                                logged_metrics ? "" : ((logged_metrics = TRUE), " [first probe of this rect only]") );
+            switch (index)
             {
-                return point.right - point.left;
-            }
-            if (index == SM_CYSCREEN)
-            {
-                return point.bottom - point.top;
+            case SM_CXSCREEN:
+            case SM_CXFULLSCREEN:
+            case SM_CXMAXIMIZED:
+            case SM_CXMAXTRACK:
+                return cx;
+            case SM_CYSCREEN:
+            case SM_CYFULLSCREEN:
+            case SM_CYMAXIMIZED:
+            case SM_CYMAXTRACK:
+                return cy;
             }
         }
     }
@@ -3954,6 +4041,44 @@ BOOL16 WINAPI SystemParametersInfo16( UINT16 uAction, UINT16 uParam,
     case SPI_GETWORKAREA:
     {
 	RECT tmp;
+        /* Multi-monitor: SPI_GETWORKAREA reports only the primary monitor's
+         * work area. When FixScreenSize is enabled, report the work area of
+         * the monitor the emulator is actually running on instead, so that
+         * 16-bit apps laying out their launch frame from this value honor a
+         * secondary (e.g. portrait) display. */
+        if (krnl386_get_config_int("otvdm", "FixScreenSize", FALSE))
+        {
+            POINT pt = { 0, 0 };
+            HMONITOR hMon = NULL;
+            /* MONITORINFOA is not typedef'd by every Windows SDK revision
+             * (some only provide tagMONITORINFO/MONITORINFO); use the
+             * portable name here as well. */
+            MONITORINFO mi = { sizeof(mi) };
+            HWND hwnd = GetForegroundWindow();
+            if (!hwnd) hwnd = GetActiveWindow();
+            if (hwnd && IsWindow(hwnd))
+                hMon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            if (!hMon && GetCursorPos(&pt))
+                hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            if (hMon && GetMonitorInfoA(hMon, &mi) &&
+                !(mi.dwFlags & MONITORINFOF_PRIMARY))
+            {
+                tmp = mi.rcWork;
+                ret = TRUE;
+                if (lpvParam)
+                {
+                    RECT16 *r16 = lpvParam;
+                    r16->left   = tmp.left;
+                    r16->top    = tmp.top;
+                    r16->right  = tmp.right;
+                    r16->bottom = tmp.bottom;
+                }
+                config_report_note( "SPI_GETWORKAREA(FixScreenSize): secondary monitor work rect L%d T%d R%d B%d (%dx%d)",
+                                    (int)tmp.left, (int)tmp.top, (int)tmp.right, (int)tmp.bottom,
+                                    (int)(tmp.right - tmp.left), (int)(tmp.bottom - tmp.top) );
+                break;
+            }
+        }
 	ret = SystemParametersInfoA( uAction, uParam, lpvParam ? &tmp : NULL, fuWinIni );
 	if (ret && lpvParam)
         {
@@ -3963,6 +4088,10 @@ BOOL16 WINAPI SystemParametersInfo16( UINT16 uAction, UINT16 uParam,
             r16->right  = tmp.right;
             r16->bottom = tmp.bottom;
         }
+        if (krnl386_get_config_int("otvdm", "FixScreenSize", FALSE))
+            config_report_note( "SPI_GETWORKAREA(primary fallback): rect L%d T%d R%d B%d (%dx%d)",
+                                (int)tmp.left, (int)tmp.top, (int)tmp.right, (int)tmp.bottom,
+                                (int)(tmp.right - tmp.left), (int)(tmp.bottom - tmp.top) );
 	break;
     }
 

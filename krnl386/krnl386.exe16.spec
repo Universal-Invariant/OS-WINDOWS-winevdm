@@ -751,6 +751,7 @@
 @ stdcall -arch=win32 GetProcessFlags(long)
 @ stdcall -arch=win32 krnl386_get_config_string(str str str ptr long)
 @ stdcall -arch=win32 krnl386_get_config_int(str str long)
+@ stdcall -arch=win32 config_report_note(str)
 @ stdcall -arch=win32 krnl386_get_compat_mode(str)
 @ stdcall -arch=win32 krnl386_set_compat_path(str)
 @ stdcall -arch=win32 GetModuleFileName16(long ptr long)

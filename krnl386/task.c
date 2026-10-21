@@ -1934,12 +1934,27 @@ const char *env_var_limitation[] =
 };
 static BOOL env_var_limit(const char *v)
 {
-    static BOOL init;
+    static volatile LONG init;   /* 0 = not done, 1 = in progress, 2 = done */
     int i;
     static BOOL limit;
-    if (!init)
+    if (init != 2)
     {
-        limit = krnl386_get_config_int("otvdm", "EnvironmentVariableLimitation", TRUE);
+        /* NOTE: the previous version declared 'static BOOL init' and set it
+         * only AFTER the config lookup, so every call re-ran
+         * krnl386_get_config_int() - with the config report enabled this
+         * flooded otvdm_config_report.log with one '[otvdm] EnvironmentVariableLimitation'
+         * entry per environment variable processed (hundreds of identical
+         * lines). Initialize exactly once. */
+        LONG state = InterlockedCompareExchange((LONG *)&init, 1, 0);
+        if (state == 0)
+        {
+            limit = krnl386_get_config_int("otvdm", "EnvironmentVariableLimitation", TRUE);
+            InterlockedExchange((LONG *)&init, 2);
+        }
+        else
+        {
+            while (init != 2) Sleep(0);   /* another thread is initializing */
+        }
     }
     if (!limit)
         return TRUE;
