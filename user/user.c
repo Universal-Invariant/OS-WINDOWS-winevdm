@@ -92,6 +92,7 @@ typedef HRESULT (WINAPI *get_dpi_for_monitor_t)( HMONITOR, int, UINT *, UINT * )
  * state is now read passively via GetProcessDpiAwareness(NULL) only, with NO
  * mutating API anywhere in this file. */
 static BOOL dpi_is_process_unaware(void);   /* forward decl: used below */
+void fix_screen_dump_coord_space( HWND hwnd, INT req_lx, INT req_ly, INT req_cx, INT req_cy );  /* fwd decl */
 
 static float dpi_unaware_scale(void)   /* desktop DC physical/logical ratio */
 {
@@ -345,9 +346,12 @@ static void pref_mon_init( void )
     pref_mon_resolve();
 }
 
-/* Public: TRUE and *out = PHYSICAL work rect when PreferredMonitor is set
- * and resolved. Caller applies DPI unscale itself (via the handle). */
-BOOL WINAPI preferred_monitor_work_rect( RECT *out, HMONITOR *phMon, float *pfDiv )
+/* Core resolver for PreferredMonitor. Returns the chosen monitor's work area
+ * in APP-SPACE coordinates: logical size (physical divided by the primary
+ * stretch factor for unaware processes) with the origin rebased into the
+ * desktop-stretch coordinate space. This is what the 16-bit world must see.
+ * For placing windows via Win32, multiply by fix_screen_scale_for_placement(). */
+static BOOL preferred_monitor_rect( RECT *out, HMONITOR *phMon, float *pfDiv )
 {
     pref_mon_init();
     if (!pref_mon_active) return FALSE;
@@ -361,62 +365,125 @@ BOOL WINAPI preferred_monitor_work_rect( RECT *out, HMONITOR *phMon, float *pfDi
         }
     }
     if (pfDiv) *pfDiv = fix_screen_monitor_divisor( pref_mon_hmon );
+
+    /* Primary stretch factor s = primaryDPI/96. An unaware process is
+     * bitmap-stretched by exactly s about the PRIMARY monitor's top-left;
+     * every coord API it calls (SetWindowPos, GetWindowRect, GetMonitorInfo)
+     * operates in the PRESENTED space: presented = phys/s (+ origin offset),
+     * while EnumDisplayMonitors bounds/work come back as RAW physical. */
+    UINT dpiX = 0, dpiY = 0;
+    float s = 1.0f;
+    static get_dpi_for_monitor_t pGDFM;
+    static int triedS;
+    if (!triedS)
+    {
+        HMODULE shcore = LoadLibraryA( "shcore.dll" );
+        triedS = 1;
+        if (shcore) pGDFM = (get_dpi_for_monitor_t)(void *)GetProcAddress( shcore, "GetDpiForMonitor" );
+    }
+    if (pGDFM && SUCCEEDED( pGDFM( pref_mon_hmon, 0, &dpiX, &dpiY ) ))
+    {
+        POINT po; po.x = pref_mon_pri_origin.x + 1; po.y = pref_mon_pri_origin.y + 1;
+        HMONITOR hPri = MonitorFromPoint( po, MONITOR_DEFAULTTOPRIMARY );
+        UINT pdX = 0, pdY = 0;
+        if (hPri && pGDFM( hPri, 0, &pdX, &pdY ) == S_OK && pdY)
+            s = (float)pdY / 96.0f;
+    }
+    else if (dpi_is_process_unaware())
+    {
+        s = dpi_unaware_scale();   /* fall back to system ratio */
+    }
+    if (s < 1.0f) s = 1.0f;
+
     if (out)
     {
-        /* Report the target work area in the coordinate space that BOTH the
-         * 16-bit app and this process' own Win32 calls see. Windows emulates
-         * DPI-unaware processes by stretching the whole desktop bitmap about
-         * the PRIMARY monitor's top-left corner:
-         *     virtual_coord = (physical - primary_phys_origin) / s + primary_phys_origin
-         * where s = primaryDPI/96. Secondary monitors therefore appear at
-         * fractional-scaled positions; we round to integers here. When the
-         * process is DPI-aware (or unscaled), s == 1 and this degenerates to
-         * the raw physical rect, which for an AWARE process already equals
-         * its view of the monitor... except an aware process sees fully
-         * per-monitor logical coords; in that case fix_screen_monitor_divisor
-         * returns 1.0 and we must instead ask shcore for nothing further --
-         * GetMonitorInfoA in an aware-on-primary process still reports the
-         * physical pixels of secondaries, so no division applies. Good enough
-         * for the supported configuration (unaware VDM under primary scaling). */
-        UINT dpiX = 0, dpiY = 0;
-        float s = 1.0f;
-        static get_dpi_for_monitor_t pGDFM;
-        static int triedS;
-        if (!triedS)
-        {
-            HMODULE shcore = LoadLibraryA( "shcore.dll" );
-            triedS = 1;
-            if (shcore) pGDFM = (get_dpi_for_monitor_t)(void *)GetProcAddress( shcore, "GetDpiForMonitor" );
-        }
-        if (pGDFM && SUCCEEDED( pGDFM( pref_mon_hmon, 0, &dpiX, &dpiY ) ))
-        {
-            /* Primary monitor DPI: the anchor of the whole-desktop stretch.
-             * The primary always contains the point (its own origin); we
-             * stored that origin at enumeration time. */
-            POINT po; po.x = pref_mon_pri_origin.x + 1; po.y = pref_mon_pri_origin.y + 1;
-            HMONITOR hPri = MonitorFromPoint( po, MONITOR_DEFAULTTOPRIMARY );
-            UINT pdX = 0, pdY = 0;
-            if (hPri && pGDFM( hPri, 0, &pdX, &pdY ) == S_OK && pdY)
-                s = (float)pdY / 96.0f;
-        }
-        else if (dpi_is_process_unaware())
-        {
-            s = dpi_unaware_scale();   /* fall back to system ratio */
-        }
-        if (s < 1.0f) s = 1.0f;
-        {
-            LONG ox = pref_mon_pri_origin.x, oy = pref_mon_pri_origin.y;
-            RECT v;
-            v.left   = ox + (LONG)((pref_mon_work.left   - ox + 0.5f) / s);
-            v.top    = oy + (LONG)((pref_mon_work.top    - oy + 0.5f) / s);
-            v.right  = ox + (LONG)((pref_mon_work.right  - ox + 0.5f) / s);
-            v.bottom = oy + (LONG)((pref_mon_work.bottom - oy + 0.5f) / s);
-            *out = v;
-        }
+        LONG ox = pref_mon_pri_origin.x, oy = pref_mon_pri_origin.y;
+        RECT v;
+        v.left   = ox + (LONG)((pref_mon_work.left   - ox + 0.5f) / s);
+        v.top    = oy + (LONG)((pref_mon_work.top    - oy + 0.5f) / s);
+        v.right  = ox + (LONG)((pref_mon_work.right  - ox + 0.5f) / s);
+        v.bottom = oy + (LONG)((pref_mon_work.bottom - oy + 0.5f) / s);
+        *out = v;
     }
     if (phMon) *phMon = pref_mon_hmon;
     return TRUE;
 }
+
+/* App-space accessor: the metric layer reports this to the 16-bit world --
+ * logical size of the preferred monitor's work area, origin rebased into the
+ * desktop-stretch coordinate space. */
+BOOL preferred_monitor_work_rect( RECT *out, HMONITOR *phMon, float *pfDiv )
+{
+    return preferred_monitor_rect( out, phMon, pfDiv );
+}
+
+/* Placement scale factor for handing coordinates to Win32 SetWindowPos from
+ * inside this process. The metric layer hands the 16-bit app the LOGICAL
+ * work rect (physical/s). Windows then DIVIDES every coord we pass to
+ * SetWindowPos by s again before DWM acts (proven empirically: raw-phys
+ * input surfaced as phys/s output). So multiply the logical rect by s to
+ * cancel that division and land the frame at exactly the target's PHYSICAL
+ * pixels. At s == 1 (no scaling / DPI-aware process) this is identity. */
+/* PUBLIC (cdecl, cross-TU): placement scale factor for window.c. */
+float fix_screen_scale_for_placement( HMONITOR hMon )
+{
+    float d = fix_screen_monitor_divisor( hMon );
+    if (d < 1.0f) d = 1.0f;
+    return d;
+}
+
+/* Diagnostic: dump the coordinate-space relationship of a window so we can
+ * measure Windows' actual virtualization behavior instead of guessing it.
+ * Compares three views of the same window:
+ *   win32-phys  : GetWindowRect via our own (unaware) process -> what Win32
+ *                 reports to us (expected: presented/logical space)
+ *   DWM-ext     : DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS) -> real
+ *                 physical pixels on the panel (expected: physical)
+ *   app-logical : what the 16-bit side requested (passed in by caller)
+ * Also probes SetProcessDpiAwarenessContext(-4) result and restores. */
+void fix_screen_dump_coord_space( HWND hwnd, INT req_lx, INT req_ly, INT req_cx, INT req_cy )
+{
+    static BOOL tried_dwm;
+    static DWORD (WINAPI *pDwmGetWinAttr)(HWND, DWORD, PVOID, DWORD);
+    RECT wr = {0,0,0,0}, ext = {0,0,0,0};
+    MONITORINFO mi = { sizeof(mi) };
+    HMONITOR hMon;
+    UINT dpiX=0, dpiY=0;
+    char ctxbuf[64];
+
+    if (!hwnd || !IsWindow(hwnd)) return;
+    if (!tried_dwm)
+    {
+        HMODULE dwm = LoadLibraryA( "dwmapi.dll" );
+        tried_dwm = TRUE;
+        if (dwm) pDwmGetWinAttr = (void*)GetProcAddress( dwm, "DwmGetWindowAttribute" );
+    }
+    GetWindowRect( hwnd, &wr );
+    if (pDwmGetWinAttr)
+        pDwmGetWinAttr( hwnd, 9 /*DWMWA_EXTENDED_FRAME_BOUNDS*/, &ext, sizeof(ext) );
+    hMon = MonitorFromWindow( hwnd, MONITOR_DEFAULTTONEAREST );
+    if (hMon && GetMonitorInfoA( hMon, &mi ))
+    {
+        config_report_note( "CoordSpace '%s': req(%d,%d %dx%d) win32rect L%d T%d R%d B%d (%dx%d) dwmext L%d T%d R%d B%d (%dx%d) monbounds L%d T%d R%d B%d (%dx%d)%s",
+                            "", req_lx, req_ly, req_cx, req_cy,
+                            (int)wr.left,(int)wr.top,(int)wr.right,(int)wr.bottom,
+                            (int)(wr.right-wr.left),(int)(wr.bottom-wr.top),
+                            (int)ext.left,(int)ext.top,(int)ext.right,(int)ext.bottom,
+                            (int)(ext.right-ext.left),(int)(ext.bottom-ext.top),
+                            (int)mi.rcMonitor.left,(int)mi.rcMonitor.top,(int)mi.rcMonitor.right,(int)mi.rcMonitor.bottom,
+                            (int)(mi.rcMonitor.right-mi.rcMonitor.left),(int)(mi.rcMonitor.bottom-mi.rcMonitor.top),
+                            "" );
+    }
+    else
+    {
+        config_report_note( "CoordSpace: req(%d,%d %dx%d) win32rect (%d,%d %dx%d) dwmext (%d,%d %dx%d) no-monitor",
+                            req_lx, req_ly, req_cx, req_cy,
+                            (int)wr.left,(int)wr.top,(int)(wr.right-wr.left),(int)(wr.bottom-wr.top),
+                            (int)ext.left,(int)ext.top,(int)(ext.right-ext.left),(int)(ext.bottom-ext.top) );
+    }
+    (void)dpiX; (void)dpiY; (void)ctxbuf;
+}
+
 
 static void config_report_note( LPCSTR fmt, ... )
 {
