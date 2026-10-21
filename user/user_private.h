@@ -134,6 +134,13 @@ extern HICON16 get_icon_16( HICON icon ) DECLSPEC_HIDDEN;
  * paths). See user.c for documentation of each function. */
 extern BOOL WINAPI fix_screen_clamp_maximized_rect( HWND hwnd32, LPINT px, LPINT py, LPINT pcx, LPINT pcy ) DECLSPEC_HIDDEN;
 extern BOOL preferred_monitor_work_rect( RECT *out, HMONITOR *phMon, float *pfDiv ) DECLSPEC_HIDDEN;
+extern BOOL preferred_monitor_presented_rect( RECT *out, HMONITOR *phMon ) DECLSPEC_HIDDEN;
+/* PreferredMonitor v6: chosen-monitor screen-size rect (bounds, app-space,
+ * origin-rebased to 0,0) used by SM_CXSCREEN/SM_CYSCREEN + WM_GETMINMAXINFO. */
+extern BOOL preferred_monitor_screen_rect( RECT *out ) DECLSPEC_HIDDEN;
+/* TRUE when [otvdm] PreferredMonitor is set and resolved; optional out HMONITOR. */
+extern BOOL WINAPI preferred_monitor_active( HMONITOR *phMon ) DECLSPEC_HIDDEN;
+extern BOOL get_fix_screen_work_rect( RECT *out ) DECLSPEC_HIDDEN;
 extern void fix_screen_dump_coord_space( HWND hwnd, INT req_lx, INT req_ly, INT req_cx, INT req_cy ) DECLSPEC_HIDDEN;
 extern float fix_screen_scale_for_placement( HMONITOR hMon ) DECLSPEC_HIDDEN;
 
