@@ -199,6 +199,7 @@ static void cfg_init( void )
     static const CHAR *keys[] = {
         "ConfigReport", "FixScreenSize", "DIBPalette", "EnableVisualStyle",
         "DefaultInstallDir", "UseGlobalLocal", "SharedWow", "ConsoleBuffer",
+        "PreferredMonitor",
     };
 
     if (cfg_init_done) return;
@@ -242,37 +243,42 @@ static void cfg_init( void )
     cfg_get_int( "otvdm", "FixScreenSize", 0, &found );
     cfg_lookup( "otvdm", "FixScreenSize(int)", found ? "1" : "0", found );
 
-    /* DPI diagnostics: the process awareness context tells us whether
-     * Windows hands this process physical pixels (aware/unaware+bitblt) or
-     * DPI-logical pixels (unaware virtualized). On a 125%-scaled primary
-     * monitor an unaware process sees SM_CXSCREEN = 3440/1.25 = 2752, which
-     * is exactly what the krnl386 probes reported — while the VDM host
-     * window itself lives in physical pixels. Log it once per process. */
+    /* DPI diagnostics — PASSIVE ONLY.  BUGFIX: this probe used to call
+     * SetProcessDpiAwarenessContext(PerMonitorV2) and then SetProcessDPIAware()
+     * purely to "read" the awareness state.  Both are WRITE-once APIs: they
+     * made otvdm.exe itself System-DPI-aware as a side effect of logging!
+     * From that moment Windows stops bitmap-virtualizing our process, every
+     * metric query returns raw physical pixels (3440x1380), and the scale
+     * ratio collapses to 1.000 — which is exactly what the log showed
+     * ("scale=1.000", work rect never divided by 1.25).  The whole
+     * FixScreenSize DPI correction therefore silently self-disabled on every
+     * scaled display, and external tools (nircmd/cmdow) could not resize the
+     * app either because the VCL main frame re-maximizes itself to whatever
+     * GetSystemMetrics hands it — physical full monitor.  Never mutate
+     * process DPI awareness from here on; read shcore!GetProcessDpiAwareness
+     * and the desktop-DC ratio only. */
     {
-        HMODULE hUser = GetModuleHandleA( "user32.dll" );
-        int aware = -1;
-        BOOL dpi10 = FALSE;
-        typedef BOOL (WINAPI *pSetProcessDpiAwarenessContext_t)(HANDLE);
-        pSetProcessDpiAwarenessContext_t pSetCtx = NULL;
-        if (hUser)
-            pSetCtx = (pSetProcessDpiAwarenessContext_t)(void *)GetProcAddress(hUser, "SetProcessDpiAwarenessContext");
-        /* probe + set: PerMonitorV2 (-4) if the OS supports it, else System Aware (-3).
-         * SetProcessDpiAwarenessContext returns FALSE when awareness was
-         * already fixed earlier (e.g. by a manifest), so also read back the
-         * current context via the legacy API result and GetDpiForWindow. */
-        if (pSetCtx && pSetCtx((HANDLE)-4)) dpi10 = TRUE;
-        else if (pSetCtx) pSetCtx((HANDLE)-3);
+        HMODULE shcore = LoadLibraryA( "shcore.dll" );   /* Win8.1+; keep loaded */
+        HRESULT (WINAPI *pGPA)( HANDLE, int * ) =
+            (HRESULT (WINAPI *)( HANDLE, int * ))(shcore ?
+                GetProcAddress( shcore, "GetProcessDpiAwareness" ) : NULL);
+        int awareness = -1;
+        const char *aname = "unknown";
+        if (pGPA && SUCCEEDED( pGPA( NULL, &awareness ) ))
+            aname = (awareness == 0) ? "UNAWARE (bitmap-stretched)" :
+                  (awareness == 1) ? "SYSTEM_AWARE" :
+                  (awareness == 2) ? "PER_MONITOR_AWARE" :
+                  (awareness == 3) ? "PER_MONITOR_V2" : "other";
+        else if (!shcore)
+            aname = "pre-8.1 (assume UNAWARE)";
         {
             HDC dc = GetDC(NULL);
             int horz = dc ? GetDeviceCaps(dc, HORZRES) : -1;
             int vert = dc ? GetDeviceCaps(dc, VERTRES) : -1;
             int dpx  = dc ? GetDeviceCaps(dc, DESKTOPVERTRES) : -1;   /* physical px on Win8.1+ */
             float scale = (dpx > 0 && vert > 0) ? (float)dpx / (float)vert : 0.0f;
-            cfg_write( "otvdm: note: launcher DPI: ctx=%s SetProcessDPIAware->%d desktop DC %dx%d DESKTOPVERTRES=%d scale=%.3f\n",
-                       dpi10 ? "PerMonitorV2 accepted (Win10 1703+)" : "ctx API absent/already-set (legacy)",
-                       SetProcessDPIAware() ? 1 : 0, horz, vert, dpx, scale );
-            aware = (horz > 0) ? (int)(scale * 1000) : -1;  /* stash for dedupe-free single line */
-            (void)aware;
+            cfg_write( "otvdm: note: launcher DPI (passive): awareness=%s desktop DC %dx%d DESKTOPVERTRES=%d scale=%.3f\n",
+                       aname, horz, vert, dpx, scale );
             if (dc) ReleaseDC(NULL, dc);
         }
     }

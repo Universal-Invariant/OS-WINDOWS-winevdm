@@ -132,9 +132,17 @@ extern HICON16 get_icon_16( HICON icon ) DECLSPEC_HIDDEN;
 /* FixScreenSize / ForceScreenWidth+Height helpers (implemented in user.c,
  * used from window.c on the SetWindowPos16/ShowWindow16/CreateWindowEx16
  * paths). See user.c for documentation of each function. */
-extern BOOL fix_screen_clamp_maximized_rect( HWND hwnd32, LPINT px, LPINT py, LPINT pcx, LPINT pcy ) DECLSPEC_HIDDEN;
-extern BOOL force_screen_size_enabled(void) DECLSPEC_HIDDEN;
-extern void force_screen_client_size( HWND hwnd32, LPCINT pref_w, LPCINT pref_h,
+extern BOOL WINAPI fix_screen_clamp_maximized_rect( HWND hwnd32, LPINT px, LPINT py, LPINT pcx, LPINT pcy ) DECLSPEC_HIDDEN;
+extern BOOL preferred_monitor_work_rect( RECT *out, HMONITOR *phMon, float *pfDiv ) DECLSPEC_HIDDEN;
+extern void fix_screen_dump_coord_space( HWND hwnd, INT req_lx, INT req_ly, INT req_cx, INT req_cy ) DECLSPEC_HIDDEN;
+extern float fix_screen_scale_for_placement( HMONITOR hMon ) DECLSPEC_HIDDEN;
+
+extern BOOL WINAPI force_screen_size_enabled(void) DECLSPEC_HIDDEN;
+/* WINAPI (__stdcall) pins the linker symbol name (_force_screen_sizes@8) so
+ * it matches between user.c and window.c even if a translation unit or an
+ * older checked-out copy of this header defaults to __cdecl. */
+extern void WINAPI force_screen_sizes( INT *pw, INT *ph ) DECLSPEC_HIDDEN;
+extern void WINAPI force_screen_client_size( HWND hwnd32, const INT *pref_w, const INT *pref_h,
                                       LPINT out_x, LPINT out_y, LPINT out_cx, LPINT out_cy ) DECLSPEC_HIDDEN;
 extern HICON get_icon_32( HICON16 icon16 ) DECLSPEC_HIDDEN;
 
